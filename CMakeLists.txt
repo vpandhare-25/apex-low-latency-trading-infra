@@ -24,6 +24,7 @@ add_library(apex_core
   src/market_simulator.cpp
   src/router.cpp
   src/analytics.cpp
+  src/order_manager.cpp
 )
 target_include_directories(apex_core PUBLIC include)
 target_link_libraries(apex_core PUBLIC ZLIB::ZLIB)
@@ -57,6 +58,7 @@ add_executable(apex_tests
   tests/test_itch.cpp
   tests/test_market_simulator.cpp
   tests/test_router.cpp
+  tests/test_order_manager.cpp
 )
 target_link_libraries(apex_tests PRIVATE apex_core GTest::gtest_main)
 include(GoogleTest)

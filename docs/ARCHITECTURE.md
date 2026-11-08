@@ -84,3 +84,19 @@ The router stops reading a venue's book at the limit price, or once that venue a
 fill the order (`OrderBook::for_each_level`). The first version copied every level with
 `depth()`, and real books have thousands of far-away levels, so that change cut the median
 decision time about 20x (169 µs to 7.4 µs for `split`), with identical routing results.
+
+## Re-routing in waves (step 4b)
+
+`OrderManager` works one parent order for one router:
+
+1. **Wave 1:** the router splits the parent, and the child orders are sent.
+2. **Wait for reports:** a child executes at `send + latency`, and its fill report reaches
+   us at `execute + latency`, because the message travels back over the same link. A slow
+   venue therefore costs twice: it executes late and reports late.
+3. **Next wave:** once every report of the wave is back, if shares are still missing (and
+   fewer than `max_waves` waves have gone out), the router is asked again with the
+   *remaining* quantity and the *current* books. A quote that disappeared is no longer in
+   the book, so the rest goes where liquidity really is. The parent's limit never changes.
+
+With `max_waves = 1`, this is exactly the single-shot behaviour of step 4, so the tool runs
+every strategy through the same `OrderManager` code.

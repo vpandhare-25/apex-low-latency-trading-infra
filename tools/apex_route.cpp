@@ -1,4 +1,4 @@
-// apex_route: compares the three routers on a real NASDAQ day.
+// apex_route: compares routing strategies on a real NASDAQ day.
 //
 // Usage: apex_route <file.NASDAQ_ITCH50[.gz]> <SYMBOL> [shares_per_order=1000]
 //
@@ -7,16 +7,17 @@
 //   move  : right after the best bid or ask (across venues) changes, at most once per
 //           30 seconds. A buy if the ask moved, otherwise a sell. These are the
 //           moments when slow venues are most likely to have stale quotes.
-// For every parent order, all three routers decide at the same moment on the same
-// books, so the comparison is paired (same market, same time, same size).
+// For every parent order, all strategies decide at the same moment on the same books,
+// so the comparison is paired (same market, same time, same size).
 // Each parent's limit is 10 bps (0.1%) away from the best opposite price at arrival.
 
-#include <chrono>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -24,6 +25,7 @@
 #include "apex/itch.hpp"
 #include "apex/itch_file_reader.hpp"
 #include "apex/market_simulator.hpp"
+#include "apex/order_manager.hpp"
 #include "apex/router.hpp"
 
 using namespace apex;
@@ -46,6 +48,14 @@ struct ParentInfo {
     Side side;
     Quantity qty;
     double mid;
+    std::uint64_t time;
+};
+
+// A strategy = a router + how many waves it may send.
+struct Strategy {
+    std::string name;
+    std::unique_ptr<Router> router;
+    int max_waves;
 };
 
 // Best bid and best ask across all venues.
@@ -78,17 +88,22 @@ int main(int argc, char** argv) {
 
     const std::vector<VenueConfig> venues = default_venues();
     MarketSimulator sim(argv[2], venues);
+    MarketView view{{}, &venues};
+    for (std::size_t v = 0; v < sim.venue_count(); ++v) view.books.push_back(&sim.book(v));
 
-    std::vector<std::unique_ptr<Router>> routers;
-    routers.push_back(std::make_unique<SingleVenueRouter>());
-    routers.push_back(std::make_unique<SplitRouter>(false));
-    routers.push_back(std::make_unique<SplitRouter>(true));
-    const std::size_t n_routers = routers.size();
-    std::vector<LatencyStats> decision_ns(n_routers);
+    std::vector<Strategy> strategies;
+    strategies.push_back({"single-venue", std::make_unique<SingleVenueRouter>(), 1});
+    strategies.push_back({"split", std::make_unique<SplitRouter>(false), 1});
+    strategies.push_back({"split+fees", std::make_unique<SplitRouter>(true), 1});
+    strategies.push_back({"split+fees+reroute", std::make_unique<SplitRouter>(true), 3});
+    const std::size_t n_strat = strategies.size();
+
+    std::vector<OrderManager> managers;
+    for (const Strategy& s : strategies) managers.emplace_back(*s.router, s.max_waves);
 
     std::vector<ParentInfo> parents;
 
-    // Creates one parent order and lets every router route it.
+    // Creates one parent order and lets every strategy start working it.
     auto send_parent = [&](Schedule schedule, Side side, std::uint64_t now) {
         const Nbbo n = nbbo(sim);
         if (!n.bid || !n.ask) return;  // need both sides to know the mid
@@ -96,23 +111,12 @@ int main(int argc, char** argv) {
         const auto collar = static_cast<Price>(double(far_side) * kLimitBps / 10000.0);
         const ParentOrder parent{side, order_size, side == Side::Buy ? far_side + collar : far_side - collar, now};
 
-        MarketView view{{}, &venues};
-        for (std::size_t v = 0; v < sim.venue_count(); ++v) view.books.push_back(&sim.book(v));
-
         const std::uint64_t parent_index = parents.size();
-        parents.push_back({schedule, side, order_size, (double(*n.bid) + double(*n.ask)) / 2.0});
-        // Rotate which router goes first, so no router always pays for a cold cache.
-        for (std::size_t k = 0; k < n_routers; ++k) {
-            const std::size_t r = (k + parent_index) % n_routers;
-            const auto t0 = std::chrono::steady_clock::now();
-            std::vector<ChildOrder> children = routers[r]->route(parent, view);
-            const auto t1 = std::chrono::steady_clock::now();
-            decision_ns[r].add(static_cast<std::uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
-            for (ChildOrder& c : children) {
-                c.tag = parent_index * n_routers + r;  // lets us find this parent+router later
-                sim.submit(c);
-            }
+        parents.push_back({schedule, side, order_size, (double(*n.bid) + double(*n.ask)) / 2.0, now});
+        // Rotate which strategy goes first, so no router always pays for a cold cache.
+        for (std::size_t k = 0; k < n_strat; ++k) {
+            const std::size_t s = (k + parent_index) % n_strat;
+            managers[s].start(parent_index * n_strat + s, parent, view, sim);  // tag -> parent+strategy
         }
     };
 
@@ -136,6 +140,9 @@ int main(int argc, char** argv) {
 
         itch::parse_message(data, len, sim);
 
+        // Fill reports that have come back by now may trigger the next wave.
+        for (OrderManager& m : managers) m.poll(ts, view, sim);
+
         // Move schedule: only messages for our stock can change our quotes.
         if (!sim.locate() || itch::read_u16(data + 1) != *sim.locate()) continue;
         const Nbbo q = nbbo(sim);
@@ -153,67 +160,85 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // ---- Group fills by (parent, router) and build the report card ----
+    // ---- Group fills by (parent, strategy) and build the report card ----
     std::unordered_map<std::uint64_t, std::vector<Fill>> fills_by_tag;
     for (const Fill& f : sim.fills()) fills_by_tag[f.tag].push_back(f);
 
-    ExecutionStats stats[2][3];
+    std::vector<ExecutionStats> stats[2] = {std::vector<ExecutionStats>(n_strat),
+                                            std::vector<ExecutionStats>(n_strat)};
+    // Simulated time from the decision to the last child's execution.
+    std::vector<LatencyStats> finish_ns[2] = {std::vector<LatencyStats>(n_strat),
+                                              std::vector<LatencyStats>(n_strat)};
+    const std::vector<Fill> no_fills;
     for (std::uint64_t p = 0; p < parents.size(); ++p) {
-        for (std::size_t r = 0; r < n_routers; ++r) {
-            const auto it = fills_by_tag.find(p * n_routers + r);
-            const std::vector<Fill> empty;
-            stats[parents[p].schedule][r].add_parent(parents[p].side, parents[p].qty, parents[p].mid,
-                                                     it == fills_by_tag.end() ? empty : it->second);
+        const ParentInfo& info = parents[p];
+        for (std::size_t s = 0; s < n_strat; ++s) {
+            const auto it = fills_by_tag.find(p * n_strat + s);
+            const std::vector<Fill>& fills = it == fills_by_tag.end() ? no_fills : it->second;
+            stats[info.schedule][s].add_parent(info.side, info.qty, info.mid, fills);
+            std::uint64_t last = 0;
+            for (const Fill& f : fills) last = std::max(last, f.arrival_time);
+            if (last > 0) finish_ns[info.schedule][s].add(last - info.time);
         }
     }
 
     std::printf("%s, %u shares per parent order, limit %.0f bps, rejected book updates: %llu\n",
                 argv[2], order_size, kLimitBps, (unsigned long long)sim.rejected());
-    for (int s = 0; s < 2; ++s) {
-        std::printf("\nschedule: %s, %llu parent orders\n", kScheduleNames[s],
-                    (unsigned long long)stats[s][0].parents());
-        std::printf("  router         fill rate  children/order  cost vs mid   total cost  of which fees\n");
-        for (std::size_t r = 0; r < n_routers; ++r) {
-            const ExecutionStats& st = stats[s][r];
-            std::printf("  %-13s  %8.2f%%  %14.2f  %7.3f bps  %10.2f $  %11.2f $\n", routers[r]->name().c_str(),
-                        st.fill_rate() * 100, st.parents() ? double(st.child_orders()) / st.parents() : 0.0,
-                        st.cost_bps(), st.cost_dollars(), st.fees_dollars());
+    for (int sc = 0; sc < 2; ++sc) {
+        std::printf("\nschedule: %s, %llu parent orders\n", kScheduleNames[sc],
+                    (unsigned long long)stats[sc][0].parents());
+        std::printf("  strategy             fill rate  children/order  cost vs mid   total cost  of which fees"
+                    "   time to finish p50 / p99\n");
+        for (std::size_t s = 0; s < n_strat; ++s) {
+            const ExecutionStats& st = stats[sc][s];
+            std::printf("  %-19s  %8.2f%%  %14.2f  %7.3f bps  %10.2f $  %11.2f $   %8.1f / %8.1f us\n",
+                        strategies[s].name.c_str(), st.fill_rate() * 100,
+                        st.parents() ? double(st.child_orders()) / st.parents() : 0.0, st.cost_bps(),
+                        st.cost_dollars(), st.fees_dollars(), finish_ns[sc][s].percentile(50) / 1000.0,
+                        finish_ns[sc][s].percentile(99) / 1000.0);
         }
-        const ExecutionStats& base = stats[s][0];
-        const ExecutionStats& smart = stats[s][2];
-        std::printf("  split+fees vs single-venue: %.3f bps cheaper per filled share, fill rate %+.2f points\n",
-                    base.cost_bps() - smart.cost_bps(), (smart.fill_rate() - base.fill_rate()) * 100);
+        const ExecutionStats& base = stats[sc][0];
+        for (std::size_t s = 2; s < n_strat; ++s) {
+            const ExecutionStats& st = stats[sc][s];
+            std::printf("  %s vs single-venue: %.3f bps cheaper per filled share, fill rate %+.2f points\n",
+                        strategies[s].name.c_str(), base.cost_bps() - st.cost_bps(),
+                        (st.fill_rate() - base.fill_rate()) * 100);
+        }
     }
 
-    // Where were shares missed? Requested vs filled per venue, for each router.
-    std::uint64_t req[2][3][8] = {}, got[2][3][8] = {};
+    // Where were shares missed? Shares filled / sent per venue, for each strategy.
+    std::vector<std::vector<std::uint64_t>> req[2], got[2];
+    for (int sc = 0; sc < 2; ++sc) {
+        req[sc].assign(n_strat, std::vector<std::uint64_t>(sim.venue_count(), 0));
+        got[sc].assign(n_strat, std::vector<std::uint64_t>(sim.venue_count(), 0));
+    }
     for (const Fill& f : sim.fills()) {
-        const std::uint64_t p = f.tag / n_routers;
-        const std::size_t r = f.tag % n_routers;
-        req[parents[p].schedule][r][f.venue] += f.requested;
-        got[parents[p].schedule][r][f.venue] += f.filled;
+        const ParentInfo& info = parents[f.tag / n_strat];
+        req[info.schedule][f.tag % n_strat][f.venue] += f.requested;
+        got[info.schedule][f.tag % n_strat][f.venue] += f.filled;
     }
     std::printf("\nshares filled / sent, per venue:\n");
-    for (int s = 0; s < 2; ++s) {
-        std::printf("  %s\n", kScheduleNames[s]);
-        for (std::size_t r = 0; r < n_routers; ++r) {
-            std::printf("    %-13s", routers[r]->name().c_str());
+    for (int sc = 0; sc < 2; ++sc) {
+        std::printf("  %s\n", kScheduleNames[sc]);
+        for (std::size_t s = 0; s < n_strat; ++s) {
+            std::printf("    %-19s", strategies[s].name.c_str());
             for (std::size_t v = 0; v < sim.venue_count(); ++v) {
-                const std::uint64_t sent = req[s][r][v];
+                const std::uint64_t sent = req[sc][s][v];
                 std::printf("  %s: %5.1f%% of %8llu", venues[v].name.c_str(),
-                            sent ? 100.0 * got[s][r][v] / sent : 0.0, (unsigned long long)sent);
+                            sent ? 100.0 * got[sc][s][v] / sent : 0.0, (unsigned long long)sent);
             }
             std::printf("\n");
         }
     }
 
-    std::printf("\nrouting decision time (in-process, one call to route(), steady_clock):\n");
-    std::printf("  router         samples     p50      p99    p99.9      max\n");
-    for (std::size_t r = 0; r < n_routers; ++r) {
-        const LatencyStats& l = decision_ns[r];
-        std::printf("  %-13s  %7zu  %6llu ns %6llu ns %6llu ns %6llu ns\n", routers[r]->name().c_str(), l.count(),
+    std::printf("\nfirst-wave routing decision time (in-process, one call to route(), steady_clock):\n");
+    std::printf("  strategy             samples     p50      p99    p99.9    waves/parent\n");
+    for (std::size_t s = 0; s < n_strat; ++s) {
+        const LatencyStats& l = managers[s].first_wave_decision_ns();
+        std::printf("  %-19s  %7zu  %6llu ns %6llu ns %6llu ns   %.3f\n", strategies[s].name.c_str(), l.count(),
                     (unsigned long long)l.percentile(50), (unsigned long long)l.percentile(99),
-                    (unsigned long long)l.percentile(99.9), (unsigned long long)l.percentile(100));
+                    (unsigned long long)l.percentile(99.9),
+                    parents.empty() ? 0.0 : double(managers[s].waves_sent()) / double(parents.size()));
     }
     return 0;
 }

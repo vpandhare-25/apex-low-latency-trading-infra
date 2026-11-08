@@ -5,8 +5,8 @@ across three venues to get the best total price. The venues are **simulated** by
 splitting one real NASDAQ feed: each real order lives on exactly one venue, and each
 venue has its own (assumed) fee and latency. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-Status: step 4 of 7. The order book, ITCH 5.0 parser, venue simulator, and three routers
-with execution analytics are done and checked against a full real NASDAQ trading day.
+Status: step 4 of 7 (with 4b). The order book, ITCH 5.0 parser, venue simulator, routers with
+re-routing, and execution analytics are done and checked against a full real NASDAQ trading day.
 
 ## Build and test
 ```bash
@@ -123,7 +123,7 @@ What the numbers say:
   shares are on the slow venue: C filled 90.6 to 91.9% of what was sent after quote changes,
   versus 99.8% on the 30 s schedule. Within its 1 ms latency, the quote the router saw is often
   gone. The single-venue router doesn't suffer as much because it sends its whole order with
-  the 10 bps limit and keeps buying deeper. Fixing this is step 4b.
+  the 10 bps limit and keeps buying deeper. Step 4b below fixes this.
 
 **Routing decision time** (AAPL run on its own, 1,421 decisions per router, one `route()`
 call timed with `steady_clock`, in-process with no network):
@@ -138,3 +138,41 @@ With about 1,400 samples, p99.9 rests on one or two data points, and the run sha
 thread with decompression, so the tail numbers are rough. When two replays ran at the same
 time, the p99 values were up to 10 to 20 times higher. Step 5 measures latency on its own
 with Google Benchmark.
+
+## Re-routing unfilled shares (step 4b)
+
+A fourth strategy, `split+fees+reroute`, uses the same fee-aware router but works each order
+in **waves** (up to 3). After every child's fill report comes back, which takes one more
+venue latency, any missing shares are routed again using the current books. Same run
+settings as step 4, paired on the same parent orders:
+
+| Schedule | Strategy | AAPL fill | AAPL cost | MSFT fill | MSFT cost |
+|---|---|---|---|---|---|
+| every 30 s | single-venue | 99.58% | 1.943 bps | 100.00% | 1.354 bps |
+| | split+fees | 99.90% | 1.169 bps | 99.97% | 0.853 bps |
+| | **split+fees+reroute** | **100.00%** | **1.168 bps** | **100.00%** | **0.853 bps** |
+| after quote change | single-venue | 99.27% | 2.061 bps | 100.00% | 1.489 bps |
+| | split+fees | 96.52% | 1.195 bps | 94.97% | 0.971 bps |
+| | **split+fees+reroute** | **100.00%** | **1.190 bps** | **100.00%** | **0.965 bps** |
+
+- **The fill-rate gap is closed** on both schedules and both stocks, and the cost per share
+  stays 0.50 to 0.87 bps below the single-venue baseline.
+- **Total cost rises a little** compared with `split+fees` (AAPL after quote changes:
+  $23,438 to $24,172) only because more shares get bought. Per share, it's slightly cheaper.
+- **Most orders need one wave:** 1.13 waves per parent on average for AAPL and 1.14 for MSFT,
+  counting both schedules.
+- **The trade-off is time.** In simulated time from decision to last execution, after quote
+  changes:
+
+  | | p50 | p99 |
+  |---|---|---|
+  | single-venue | 50 µs | 1.0 ms |
+  | split+fees | 1.0 ms | 1.0 ms |
+  | split+fees+reroute | 1.0 ms | 3.3 ms (AAPL), 3.5 ms (MSFT) |
+
+  The split routers nearly always use slow venue C, so their median is its 1 ms latency. A
+  second wave waits for C's report (another 1 ms) before it can be sent.
+
+First-wave decision times in this run had p50 values of 1.6 to 4.0 µs for the split
+strategies. These identical routers differ by about ±1 µs between strategies and between
+runs, which shows how noisy in-process timing is. Step 5 benchmarks this properly.
