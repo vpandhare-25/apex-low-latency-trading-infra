@@ -14,16 +14,25 @@ endif()
 option(APEX_SANITIZE "Build with address + undefined-behavior sanitizers" OFF)
 
 # ---- Core library: everything except main() and tests ----
+find_package(ZLIB REQUIRED)  # reads gzip-compressed ITCH files
+
 add_library(apex_core
   src/order_book.cpp
+  src/itch_file_reader.cpp
+  src/book_builder.cpp
 )
 target_include_directories(apex_core PUBLIC include)
+target_link_libraries(apex_core PUBLIC ZLIB::ZLIB)
 target_compile_options(apex_core PRIVATE -Wall -Wextra -Wpedantic)
 
 if(APEX_SANITIZE)
   target_compile_options(apex_core PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
   target_link_options(apex_core PUBLIC -fsanitize=address,undefined)
 endif()
+
+# ---- Command-line tools ----
+add_executable(apex_replay tools/apex_replay.cpp)
+target_link_libraries(apex_replay PRIVATE apex_core)
 
 # ---- Unit tests (GoogleTest is downloaded automatically) ----
 include(FetchContent)
@@ -37,6 +46,7 @@ FetchContent_MakeAvailable(googletest)
 enable_testing()
 add_executable(apex_tests
   tests/test_order_book.cpp
+  tests/test_itch.cpp
 )
 target_link_libraries(apex_tests PRIVATE apex_core GTest::gtest_main)
 include(GoogleTest)
