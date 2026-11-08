@@ -18,14 +18,15 @@ TakeResult take_liquidity(const OrderBook& book, Side our_side, Quantity qty, Pr
     const Side resting_side = (our_side == Side::Buy) ? Side::Sell : Side::Buy;
 
     TakeResult result;
-    for (const Level& level : book.depth(resting_side, book.level_count(resting_side))) {
+    book.for_each_level(resting_side, [&](const Level& level) {
         const bool too_expensive = (our_side == Side::Buy) ? level.price > limit : level.price < limit;
-        if (too_expensive || result.filled == qty) break;
+        if (too_expensive) return false;
 
         const Quantity take = std::min(level.quantity, qty - result.filled);
         result.filled += take;
         result.notional += level.price * static_cast<std::int64_t>(take);
-    }
+        return result.filled < qty;  // keep walking only while shares are still needed
+    });
     return result;
 }
 

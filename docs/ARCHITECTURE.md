@@ -62,3 +62,25 @@ the extra delay, including liquidity other traders took in the meantime.
 **Simplification:** our fills don't remove shares from the venue books, because real
 messages keep arriving for those same orders. That's accurate only for small orders that
 are spaced out, which is how the experiments are designed.
+
+## Routers and analytics (step 4)
+
+A parent order (side, size, limit) is turned into child orders by one of three routers:
+
+| Router | Idea |
+|---|---|
+| `single-venue` | Baseline. Send everything to the venue with the best top price, with the parent's limit. |
+| `split` | Gather every level on every venue within the limit, sort by price, fill from the top. One child per venue, capped at the worst price chosen there. |
+| `split+fees` | Same, but sort by price **plus fee** (buy) or **minus fee** (sell). |
+
+Having three routers is an *ablation*: `split` vs `single-venue` shows what splitting
+is worth, and `split+fees` vs `split` shows what fee awareness is worth.
+
+`ExecutionStats` measures all-in cost against the **arrival mid** (the midpoint of the best
+bid and ask across venues at decision time), including fees, in basis points.
+`LatencyStats` reports nearest-rank percentiles.
+
+The router stops reading a venue's book at the limit price, or once that venue alone could
+fill the order (`OrderBook::for_each_level`). The first version copied every level with
+`depth()`, and real books have thousands of far-away levels, so that change cut the median
+decision time about 20x (169 µs to 7.4 µs for `split`), with identical routing results.

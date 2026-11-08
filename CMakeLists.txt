@@ -22,6 +22,8 @@ add_library(apex_core
   src/book_builder.cpp
   src/venue.cpp
   src/market_simulator.cpp
+  src/router.cpp
+  src/analytics.cpp
 )
 target_include_directories(apex_core PUBLIC include)
 target_link_libraries(apex_core PUBLIC ZLIB::ZLIB)
@@ -37,6 +39,8 @@ add_executable(apex_replay tools/apex_replay.cpp)
 target_link_libraries(apex_replay PRIVATE apex_core)
 add_executable(apex_venues tools/apex_venues.cpp)
 target_link_libraries(apex_venues PRIVATE apex_core)
+add_executable(apex_route tools/apex_route.cpp)
+target_link_libraries(apex_route PRIVATE apex_core)
 
 # ---- Unit tests (GoogleTest is downloaded automatically) ----
 include(FetchContent)
@@ -52,6 +56,7 @@ add_executable(apex_tests
   tests/test_order_book.cpp
   tests/test_itch.cpp
   tests/test_market_simulator.cpp
+  tests/test_router.cpp
 )
 target_link_libraries(apex_tests PRIVATE apex_core GTest::gtest_main)
 include(GoogleTest)

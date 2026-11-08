@@ -5,8 +5,8 @@ across three venues to get the best total price. The venues are **simulated** by
 splitting one real NASDAQ feed: each real order lives on exactly one venue, and each
 venue has its own (assumed) fee and latency. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-Status: step 3 of 7. The order book, ITCH 5.0 parser and venue simulator are done and
-checked against a full real NASDAQ trading day.
+Status: step 4 of 7. The order book, ITCH 5.0 parser, venue simulator, and three routers
+with execution analytics are done and checked against a full real NASDAQ trading day.
 
 ## Build and test
 ```bash
@@ -78,3 +78,63 @@ At random moments, a quote seen 1 ms earlier is almost always still there, so la
 cost very little in this test. Latency hurts most when the market is moving, which these
 evenly spaced probes mostly miss. The router experiments in step 4 should also measure
 probes sent right after price changes.
+
+## Router comparison (step 4)
+
+```bash
+./build/apex_route data/12302019.NASDAQ_ITCH50.gz AAPL      # optional 3rd arg: shares per order
+```
+
+Parent orders are 1,000 shares, with the limit 10 bps past the best opposite price. Between
+09:45 and 15:45 they're sent on two schedules: every 30 s (alternating buy and sell), and
+right after the best quote changes (at most once per 30 s). All three routers decide on the
+same books at the same moment, so the comparison is paired. Cost is the all-in cost (price
+plus fees) against the arrival mid, per filled share. Same dataset and machine as above.
+
+**AAPL**
+
+| Schedule | Router | Fill rate | Cost vs mid | Total cost |
+|---|---|---|---|---|
+| every 30 s (721 orders) | single-venue | 99.58% | 1.943 bps | $40,493 |
+| | split | 99.92% | 1.173 bps | $24,526 |
+| | split+fees | 99.90% | 1.169 bps | $24,431 |
+| after quote change (700) | single-venue | 99.27% | 2.061 bps | $41,561 |
+| | split | 96.64% | 1.201 bps | $23,588 |
+| | split+fees | 96.52% | 1.195 bps | $23,438 |
+
+**MSFT**
+
+| Schedule | Router | Fill rate | Cost vs mid | Total cost |
+|---|---|---|---|---|
+| every 30 s (721 orders) | single-venue | 100.00% | 1.354 bps | $15,401 |
+| | split | 99.96% | 0.872 bps | $9,911 |
+| | split+fees | 99.97% | 0.853 bps | $9,695 |
+| after quote change (649) | single-venue | 100.00% | 1.489 bps | $15,243 |
+| | split | 95.94% | 0.991 bps | $9,734 |
+| | split+fees | 94.97% | 0.971 bps | $9,436 |
+
+What the numbers say:
+- **Splitting across venues is where the savings come from.** It's 0.5 to 0.9 bps cheaper
+  per filled share than the single-venue baseline, because it takes the best levels on every
+  venue instead of walking deep into one venue's book.
+- **Adding fees to the ranking helps only a little** here (0.004 to 0.02 bps). It does move
+  shares to cheaper venues, and total fees fall about 5 to 13%.
+- **The trade-off is fills right after quote changes.** The AAPL breakdown shows the missed
+  shares are on the slow venue: C filled 90.6 to 91.9% of what was sent after quote changes,
+  versus 99.8% on the 30 s schedule. Within its 1 ms latency, the quote the router saw is often
+  gone. The single-venue router doesn't suffer as much because it sends its whole order with
+  the 10 bps limit and keeps buying deeper. Fixing this is step 4b.
+
+**Routing decision time** (AAPL run on its own, 1,421 decisions per router, one `route()`
+call timed with `steady_clock`, in-process with no network):
+
+| Router | p50 | p99 | p99.9 |
+|---|---|---|---|
+| single-venue | 334 ns | 1.3 µs | 15.4 µs |
+| split | 5.3 µs | 21.6 µs | 135 µs |
+| split+fees | 3.3 µs | 19.9 µs | 79.6 µs |
+
+With about 1,400 samples, p99.9 rests on one or two data points, and the run shares a
+thread with decompression, so the tail numbers are rough. When two replays ran at the same
+time, the p99 values were up to 10 to 20 times higher. Step 5 measures latency on its own
+with Google Benchmark.
