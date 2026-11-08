@@ -51,6 +51,7 @@ public:
     // Up to `n` best levels on one side, best first. Used by the router.
     std::vector<Level> depth(Side side, std::size_t n) const;
 
+    bool contains(OrderId id) const { return orders_.count(id) != 0; }
     std::size_t order_count() const { return orders_.size(); }
     std::size_t level_count(Side side) const;
 
