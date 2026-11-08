@@ -40,6 +40,8 @@ add_executable(apex_replay tools/apex_replay.cpp)
 target_link_libraries(apex_replay PRIVATE apex_core)
 add_executable(apex_venues tools/apex_venues.cpp)
 target_link_libraries(apex_venues PRIVATE apex_core)
+add_executable(apex_extract tools/apex_extract.cpp)
+target_link_libraries(apex_extract PRIVATE apex_core)
 add_executable(apex_route tools/apex_route.cpp)
 target_link_libraries(apex_route PRIVATE apex_core)
 
@@ -52,6 +54,26 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(googletest)
 
+# ---- Benchmarks (Google Benchmark is downloaded automatically) ----
+set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
+set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  benchmark
+  URL https://github.com/google/benchmark/archive/refs/tags/v1.9.1.tar.gz
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
+FetchContent_MakeAvailable(benchmark)
+add_executable(apex_bench bench/apex_bench.cpp)
+target_include_directories(apex_bench PRIVATE bench)
+target_link_libraries(apex_bench PRIVATE apex_core benchmark::benchmark)
+add_executable(apex_latency bench/apex_latency.cpp)
+target_include_directories(apex_latency PRIVATE bench)
+target_link_libraries(apex_latency PRIVATE apex_core)
+add_executable(apex_depth bench/apex_depth.cpp)
+target_include_directories(apex_depth PRIVATE bench)
+target_link_libraries(apex_depth PRIVATE apex_core)
+
 enable_testing()
 add_executable(apex_tests
   tests/test_order_book.cpp
@@ -59,6 +81,7 @@ add_executable(apex_tests
   tests/test_market_simulator.cpp
   tests/test_router.cpp
   tests/test_order_manager.cpp
+  tests/test_order_map.cpp
 )
 target_link_libraries(apex_tests PRIVATE apex_core GTest::gtest_main)
 include(GoogleTest)

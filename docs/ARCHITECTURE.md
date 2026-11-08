@@ -37,8 +37,8 @@ router needs: *how many shares are available at each price*.
 Each `Level` stores total shares and number of orders at that price. When the last
 order at a price leaves, the level is erased.
 
-`std::map` is the simple, correct baseline. In step 5 we benchmark it against a
-cache-friendly flat-array book and keep both, so the speedup is measured, not claimed.
+`std::map` is the simple, correct baseline. Step 5 adds two alternatives with the same
+API (see below), and typed tests run every book test on all three.
 
 ## Venues (step 3)
 
@@ -100,3 +100,25 @@ decision time about 20x (169 µs to 7.4 µs for `split`), with identical routing
 
 With `max_waves = 1`, this is exactly the single-shot behaviour of step 4, so the tool runs
 every strategy through the same `OrderManager` code.
+
+## Faster order books (step 5)
+
+| Book | Price levels | Order id → order |
+|---|---|---|
+| `OrderBook` | `std::map` (red-black tree) | `std::unordered_map` |
+| `FlatOrderBook` | sorted `std::vector`, best price at the back | `std::unordered_map` |
+| `FastOrderBook` | sorted `std::vector`, best price at the back | `FlatOrderMap` |
+
+`FlatOrderMap` (`order_map.hpp`) is an open-addressing hash table with linear probing:
+every entry lives in one array, kept at most half full, with Fibonacci hashing and
+backward-shift deletion (no tombstones). `std::unordered_map` allocates a separate node per
+order, so a lookup usually means a cache miss.
+
+Changing one thing at a time shows where the time actually goes: `FlatOrderBook` changes
+only the levels, and `FastOrderBook` also changes the hash map.
+
+**Trade-off in the vector levels:** inserting a level shifts every *better-priced* level
+toward the back. Near the best price that's a handful of elements, but real books are
+thousands of levels deep (AAPL reached 4,227 bid levels), and about 6% of new levels shift
+100 or more. Those rare shifts are the p99 tail. A tree costs O(log n) every time. A
+hybrid design (vector for the top N levels, tree below) is the obvious next step.

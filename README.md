@@ -5,8 +5,8 @@ across three venues to get the best total price. The venues are **simulated** by
 splitting one real NASDAQ feed: each real order lives on exactly one venue, and each
 venue has its own (assumed) fee and latency. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-Status: step 4 of 7 (with 4b). The order book, ITCH 5.0 parser, venue simulator, routers with
-re-routing, and execution analytics are done and checked against a full real NASDAQ trading day.
+Status: step 5 of 7. The order books, ITCH 5.0 parser, venue simulator, routers with re-routing,
+execution analytics and benchmarks are done and checked against a full real NASDAQ trading day.
 
 ## Build and test
 ```bash
@@ -176,3 +176,70 @@ settings as step 4, paired on the same parent orders:
 First-wave decision times in this run had p50 values of 1.6 to 4.0 µs for the split
 strategies. These identical routers differ by about ±1 µs between strategies and between
 runs, which shows how noisy in-process timing is. Step 5 benchmarks this properly.
+
+## Benchmarks (step 5)
+
+```bash
+./build/apex_extract data/12302019.NASDAQ_ITCH50.gz AAPL data/AAPL.itch   # once, about 40 s
+./build/apex_bench   data/AAPL.itch --benchmark_repetitions=10 --benchmark_report_aggregates_only=true
+./build/apex_latency data/AAPL.itch 3
+./build/apex_depth   data/AAPL.itch
+```
+
+Input: all 1,512,179 AAPL book events from 2019-12-30, held in memory, so no disk reads or
+decompression are included. Machine: Apple M1 (8 cores, 8 GB), macOS 26.5, Apple clang 17,
+Release (`-O3`), single thread. The 1-minute load average was about 4 to 5 during the runs,
+mostly a macOS Bluetooth service using one core. Values are medians of 10 repetitions, with
+the coefficient of variation (CV) under 3% except where noted.
+
+**Throughput (Google Benchmark)**
+
+| Benchmark | Time for the whole day | Per event | Rate |
+|---|---|---|---|
+| Parse ITCH (decode only) | 13.9 ms | 9.2 ns | 108.6 M msg/s (2.87 GiB/s) |
+| `OrderBook` replay (`std::map`) | 212 ms (CV 9%) | 140 ns | 7.13 M/s |
+| `FlatOrderBook` replay | 213 ms | 141 ns | 7.12 M/s |
+| `FastOrderBook` replay | **136 ms** | **90 ns** | **11.16 M/s** |
+| `FastOrderBook` + read best bid/ask after every event | 138 ms | 91 ns | 10.96 M/s |
+| Hash-map work alone (`std::unordered_map`, no levels) | 102 ms | 67 ns | 14.8 M/s |
+
+- **The hash map was the bottleneck, not the price levels.** Swapping only the levels to a
+  sorted vector (`FlatOrderBook`) changed nothing. The `unordered_map` work alone takes
+  102 ms of the 212 ms replay. Replacing it with an open-addressing table
+  (`FastOrderBook`) makes replay **1.56x faster** than the `std::map` baseline.
+- **Parsing is cheap** at 9 ns per message. The 40 s full-file replay in step 2 was almost
+  all decompression.
+
+**Per-update latency** (`apex_latency`, every update timed with `steady_clock`, 3 rounds
+that agreed within one clock tick; values in ns):
+
+| Book | p50 | p90 | p99 | p99.9 | p99.99 |
+|---|---|---|---|---|---|
+| `OrderBook` | 125 | 208 | **334** | **500** | 1,084–1,292 |
+| `FlatOrderBook` | 84 | 208 | 792 | 1,000–1,042 | 1,500–1,792 |
+| `FastOrderBook` | **42** | **125** | 708–709 | 958–959 | 1,375–1,458 |
+
+The clock on this machine ticks every 41 ns, and reading it twice costs about one tick, so
+the p50 values are only accurate to about ±41 ns. 42 ns means one tick.
+
+- **The flat books win the typical case but lose the tail.** `FastOrderBook` is 3x faster at
+  p50 and about 2x slower at p99. `apex_depth` explains why: the AAPL book reached
+  **4,227 bid levels** (MSFT: 2,969). In a sorted vector with the best price at the back,
+  creating a level shifts every better-priced level. That's under 10 for 84% of new AAPL
+  levels, but 100 or more for 5.8% of them, and 1,000 or more for 2.5% (MSFT: 12.6% and
+  6.2%). Those rare large memory moves are the p99. The tree pays O(log n) every time,
+  so its tail is flatter.
+- **Correctness on real data:** across all 4.86 M AAPL, MSFT and SPY updates, the three books
+  report the same best bid and ask after every update, with 0 rejected updates.
+
+**Routing decision** (`BM_Route`, venue books as of 12:00, buy order, median of 10):
+
+| Order size | single-venue | split | split+fees |
+|---|---|---|---|
+| 100 shares | 52 ns | 290 ns | 291 ns |
+| 1,000 shares | 52 ns | 586 ns | 598 ns |
+| 10,000 shares | 52 ns | 1,047 ns | 1,074 ns |
+
+The split routers cost more for bigger orders because they read more levels. The
+in-process timings in step 4 (about 2 to 5 µs) were inflated by timer overhead, a cold cache
+and the decompression running in the same thread, which is why benchmarks run on their own.
