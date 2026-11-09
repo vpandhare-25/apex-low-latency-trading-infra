@@ -1,0 +1,6 @@
+build/
+build-*/
+data/
+.venv/
+.git/
+results/

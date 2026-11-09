@@ -1,0 +1,17 @@
+symbol,schedule,strategy,fill_rate_pct,cost_bps,total_cost_usd,fees_usd
+AAPL,every 30 s,single-venue,99.58,1.943,40493.23,1833.93
+AAPL,every 30 s,split,99.92,1.173,24526.30,1688.45
+AAPL,every 30 s,split+fees,99.90,1.169,24431.41,1610.35
+AAPL,every 30 s,split+fees+reroute,100.00,1.168,24443.03,1611.54
+AAPL,after quote change,single-venue,99.27,2.061,41561.44,1684.89
+AAPL,after quote change,split,96.64,1.201,23587.53,1597.69
+AAPL,after quote change,split+fees,96.52,1.195,23438.35,1520.57
+AAPL,after quote change,split+fees+reroute,100.00,1.190,24171.98,1572.21
+MSFT,every 30 s,single-venue,100.00,1.354,15400.64,2029.00
+MSFT,every 30 s,split,99.96,0.872,9910.92,1741.12
+MSFT,every 30 s,split+fees,99.97,0.853,9695.45,1525.11
+MSFT,every 30 s,split+fees+reroute,100.00,0.853,9697.75,1525.33
+MSFT,after quote change,single-venue,100.00,1.489,15243.43,1798.00
+MSFT,after quote change,split,95.94,0.991,9734.11,1509.36
+MSFT,after quote change,split+fees,94.97,0.971,9435.74,1303.42
+MSFT,after quote change,split+fees+reroute,100.00,0.965,9880.47,1360.11

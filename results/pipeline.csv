@@ -1,0 +1,8 @@
+threads,layout,round1_s,round2_s,round3_s
+1,[gunzip+parse+books],67.92,67.79,77.73
+2,[gunzip] > [parse+books],55.72,59.33,53.14
+2,[gunzip+parse] > [books],59.87,60.71,54.61
+3,[gunzip] > [parse] > [books],72.62,71.49,64.98
+3,[gunzip+parse] > [books x2],44.24,56.38,36.28
+4,[gunzip] > [parse] > [books x2],49.40,55.11,42.90
+5,[gunzip] > [parse] > [books x3],39.32,41.09,34.72

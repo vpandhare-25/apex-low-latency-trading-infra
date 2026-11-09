@@ -1,0 +1,7 @@
+book,replay_ms,events_per_sec_millions
+OrderBook (std::map),208,7.28
+FlatOrderBook,212,7.16
+FastOrderBook,136,11.18
+Hybrid N=16,108,14.08
+Hybrid N=64,110,13.80
+Hybrid N=256,133,11.37

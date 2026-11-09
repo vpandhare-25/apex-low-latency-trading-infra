@@ -1,354 +1,198 @@
 # Apex — Low-Latency Multi-Venue Trading Engine
 
-C++20 engine that rebuilds order books from real NASDAQ ITCH 5.0 data and routes orders
-across three venues to get the best total price. The venues are **simulated** by
-splitting one real NASDAQ feed: each real order lives on exactly one venue, and each
-venue has its own (assumed) fee and latency. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Apex is a C++20 engine that rebuilds order books from **real NASDAQ market data**, routes
+orders across three trading venues for the best all-in price, and processes a full trading
+day (268.7 million messages, all 8,892 stocks) with a lock-free multithreaded pipeline.
+Every number below comes from a real run on a real NASDAQ day, with the hardware and method
+stated.
 
-Status: step 6 of 7. The order books, ITCH 5.0 parser, venue simulator, routers with re-routing,
-execution analytics, benchmarks and a multithreaded market-data pipeline are done and checked against
-a full real NASDAQ trading day.
+**Stack:** C++20 · CMake · GoogleTest · Google Benchmark · zlib · Python (matplotlib) for charts
+· Docker. It builds and passes all **110 tests** with Apple clang on macOS and with GCC on Linux.
 
-## Build and test
+## Highlights
+
+| | Result |
+|---|---|
+| **Correct on real data** | Rebuilds every book from NASDAQ ITCH 5.0 (2019-12-30) with **0 rejected updates** and **0 crossed books**. All book designs and all thread layouts produce identical results. |
+| **Fast order book** | A hybrid book (best 16 price levels in a sorted vector, deeper levels in a tree, plus an open-addressing hash map) is **1.93x the throughput** of a `std::map` book, with p50 / p99 of **42 / 250 ns** per update versus 125 / 375 ns. |
+| **Fast parser** | Decodes ITCH at **108.6 M messages/s** (9.2 ns per message). |
+| **Smart order routing** | Right after quote changes, it's **42% cheaper than single-venue routing for AAPL** (2.061 → 1.190 bps) and **35% cheaper for MSFT** (1.489 → 0.965 bps), with **100% of shares filled** thanks to wave-based re-routing. A routing decision takes **598 ns**. |
+| **Multithreaded pipeline** | Books for all 8,892 stocks from the 3.5 GB compressed file in **39.3 s versus 67.9 s on one thread (1.73x)**, using lock-free SPSC queues and per-stock sharding. |
+
+<sub>Apple M1 (4 performance + 4 efficiency cores, 8 GB), Release build. Details and every raw
+number: [docs/RESULTS.md](docs/RESULTS.md) and [results/](results/).</sub>
+
+## Results
+
+### Order book: what each change was worth
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="results/charts/book_throughput-dark.png">
+  <img alt="Replay time for the whole AAPL day: std::map book 208 ms, sorted-vector levels 212 ms, plus open-addressing hash map 136 ms, hybrid 108 ms" src="results/charts/book_throughput-light.png" width="720">
+</picture>
+
+Changing one piece at a time showed where the time actually went. Moving the price levels
+into a cache-friendly sorted vector changed **nothing**. Benchmarking the hash map on its
+own showed it was about half the cost, so replacing `std::unordered_map` with an
+open-addressing table gave the first real speedup.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="results/charts/book_latency-dark.png">
+  <img alt="Per-update latency in ns. p50: std::map 125, FastOrderBook 42, Hybrid 42. p99: 375, 708, 250. p99.9: 541, 958, 417" src="results/charts/book_latency-light.png" width="720">
+</picture>
+
+The faster book had a worse tail: p99 was 708 ns versus 375 ns. Measuring the real book
+explained why. AAPL's book reaches 4,227 price levels, and about 6% of new levels forced the
+vector to shift 100 or more entries. The **hybrid** book keeps only the best 16 levels in the
+vector and the rest in a tree, which fixed the tail while keeping the fast median.
+
+### Smart order routing
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="results/charts/router-dark.png">
+  <img alt="Cost and fill rate per routing strategy for AAPL and MSFT right after quote changes" src="results/charts/router-light.png" width="760">
+</picture>
+
+Splitting orders across venues cuts cost, but the slow venue's quotes are often gone by the
+time a child order arrives (1 ms later), so fills dropped to 95–96.5%. **Re-routing in
+waves** (wait for fill reports, then send the missing shares on the current books) brings
+fills to 100% and keeps the savings. The trade-off is time: p99 time-to-finish rises from
+1 ms to about 3.4 ms.
+
+### Multithreaded pipeline
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="results/charts/pipeline-dark.png">
+  <img alt="Pipeline speedup by thread layout, from 0.95x to 1.73x" src="results/charts/pipeline-light.png" width="720">
+</picture>
+
+Each thread records how long it waits on its queues, and the thread that never waits is the
+bottleneck. That was the **books stage** (8,892 books don't fit in cache). Giving the parser
+its own thread *slowed things down* (0.95x), while sharding the books across 3 threads gave
+the best result. It isn't 3–5x because the M1 has only 4 performance cores and every thread
+shares memory bandwidth.
+
+## How it works
+
+Two programs share the same decoder and order books.
+
+**1. Market-data pipeline** (`apex_pipeline`): books for every stock, multithreaded.
+
+```
+ NASDAQ ITCH 5.0 (.gz, 3.5 GB)
+        │
+        ▼
+ ┌───────────────┐  buffers   ┌────────────────┐  events   ┌──────────────────────────────┐
+ │ gunzip thread │ ──SPSC───▶ │ parse thread   │ ──SPSC──▶ │ book threads, sharded by      │
+ └───────────────┘  queue     │ (ITCH decoder) │  queues   │ stock: a HybridOrderBook for  │
+                              └────────────────┘           │ each of the 8,892 stocks      │
+                                                           └──────────────────────────────┘
+```
+
+**2. Routing experiment** (`apex_route`): one stock, three simulated venues.
+
+```
+ NASDAQ ITCH 5.0 ──▶ Market simulator: the stock's real orders split across venues
+                     A / B / C (50/20/30%), each with its own fee and latency
+                              │ venue books at decision time
+                              ▼
+                     Router + OrderManager: split by price + fee, send child orders,
+                     wait for fill reports, re-route what didn't fill
+                              │ fills
+                              ▼
+                     Execution analytics: cost vs arrival mid (bps), fill rate,
+                     time to finish, decision latency
+```
+
+| Component | File | What it does |
+|---|---|---|
+| ITCH decoder | [`itch.hpp`](include/apex/itch.hpp) | Big-endian binary decode of the 7 message types that change the book, as a template (no virtual calls) |
+| File reader / framer | [`itch_file_reader`](include/apex/itch_file_reader.hpp), [`pipeline.hpp`](include/apex/pipeline.hpp) | Streams the `.gz` file through zlib without unpacking it to disk, and rebuilds frames split across chunks |
+| Order books | [`order_book`](include/apex/order_book.hpp), [`flat_order_book.hpp`](include/apex/flat_order_book.hpp) | `std::map` baseline, plus flat and hybrid books built from pluggable level stores and hash maps |
+| Hash map | [`order_map.hpp`](include/apex/order_map.hpp) | Open addressing, linear probing, Fibonacci hashing, backward-shift deletion |
+| Venues | [`market_simulator`](include/apex/market_simulator.hpp) | Splits real orders across venues by hash; child orders fill against the book as of *send time + latency* |
+| Routers | [`router`](include/apex/router.hpp), [`order_manager`](include/apex/order_manager.hpp) | Single-venue baseline, split by price, split by price + fee, and wave-based re-routing |
+| Analytics | [`analytics`](include/apex/analytics.hpp) | All-in cost against the arrival mid in bps, fill rate, nearest-rank percentiles |
+| Lock-free queue | [`spsc_queue.hpp`](include/apex/spsc_queue.hpp) | Acquire/release ring buffer, cached counters, counters on separate cache lines |
+| Pipeline | [`pipeline`](include/apex/pipeline.hpp) | 1 to N threads running the same code, checked with a per-stock checksum |
+
+More design detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## How correctness is checked
+
+- **Rebuilds real data exactly:** replaying real NASDAQ data gives 0 rejected updates, 0 crossed
+  books, and an empty book at the close (day orders expire), for AAPL, MSFT, SPY and all
+  8,892 stocks.
+- **Differential tests:** every book design runs the same 50,000 random operations, and the full
+  book must match after every step. The same holds on 4.86 M real updates, including all
+  4,720 AAPL price levels compared at 12:00.
+- **Venue split:** the three venue books always add up exactly to the real book.
+- **Lock-free queue:** 5 M values pass between two threads with no gaps or repeats.
+- **Pipeline:** every thread layout must produce the same checksum of every stock's best bid
+  and ask after every update, including with 37-byte chunks that split almost every message.
+- **Portable:** builds on Apple clang (macOS) and GCC (Linux, via Docker).
+
+## Honest limitations
+
+- **Simulated venues:** there's one real exchange in the data. Venues A, B and C are simulated
+  by splitting NASDAQ's real orders between them, and their fees and latencies are assumed
+  values, not any real exchange's.
+- **No market impact:** our own fills don't remove liquidity from the simulated books, which is
+  reasonable only for small, spaced-out orders, and that's how the experiments are designed.
+- **One day, one machine:** one trading day (2019-12-30), routing evaluated on AAPL and MSFT,
+  all timings on one laptop. Pipeline timings vary up to about ±15% between runs (macOS
+  decides which core runs each thread), so the README reports medians of repeated runs.
+- **Timer resolution:** the clock on this machine ticks every 41 ns, so p50 values near 42 ns
+  mean "about one tick."
+- **Replay, not live:** the pipeline's queue hand-off latency (milliseconds) reflects queues
+  kept full by an as-fast-as-possible replay, not a live feed.
+- **Not covered:** no network stack, kernel bypass, or exchange order-entry protocol.
+
+## Build and run
+
 ```bash
 cmake -S . -B build && cmake --build build -j && ctest --test-dir build --output-on-failure
 ```
-Requires CMake >= 3.20 and a C++20 compiler. GoogleTest downloads automatically.
 
-Results will be added only from real benchmark runs, with hardware and dataset listed.
+You need CMake 3.20 or newer, a C++20 compiler and zlib. GoogleTest and Google Benchmark
+download automatically.
 
-## Replay real NASDAQ data
-NASDAQ publishes free full-day ITCH 5.0 sample files at
-https://emi.nasdaq.com/ITCH/Nasdaq%20ITCH/ (each is several GB). Put one in `data/` and run:
-```bash
-./build/apex_replay data/12302019.NASDAQ_ITCH50.gz AAPL 12:00   # time is optional: prints the book then
-```
-The `.gz` file is read directly, so there's no need to unzip it.
-
-## Correctness check on real data (step 2)
-
-Dataset: NASDAQ TotalView-ITCH 5.0, full trading day 2019-12-30
-(`12302019.NASDAQ_ITCH50.gz`, 3.52 GB compressed, gzip CRC verified).
-Machine: Apple M1, macOS, Apple clang 17, Release build, single thread.
-
-| | AAPL | MSFT | SPY |
-|---|---|---|---|
-| Add orders | 698,744 | 576,026 | 991,829 |
-| Executions | 60,543 | 35,315 | 42,635 |
-| Partial cancels | 1,467 | 840 | 19,861 |
-| Deletes | 654,457 | 548,858 | 960,499 |
-| Replaces | 96,968 | 54,873 | 117,317 |
-| **Rejected updates** (unknown order / too many shares) | **0** | **0** | **0** |
-| **Crossed or locked book** after an update | **0** | **0** | **0** |
-| Orders left at close (day orders expire, so 0 is correct) | 0 | 0 | 0 |
-
-The file has 268,744,780 messages, and none had a bad length. AAPL's book at 12:00 had a
-best bid of $290.45 and a best ask of $290.49.
-
-A full replay took 38–45 s (about 6–7 million messages/s), but this is **not** a parser
-benchmark: just decompressing the file (`gzip -t`) takes about 26 s on the same machine, so zlib
-is most of the time. Parser and book speed will be measured on their own in step 5.
-
-## Three simulated venues (step 3)
+**Get the data.** NASDAQ publishes free full-day ITCH 5.0 files at
+https://emi.nasdaq.com/ITCH/Nasdaq%20ITCH/. This project uses `12302019.NASDAQ_ITCH50.gz`
+(3.52 GB). Put it in `data/`; the `.gz` file is read directly.
 
 ```bash
-./build/apex_venues data/12302019.NASDAQ_ITCH50.gz AAPL
+./build/apex_replay   data/12302019.NASDAQ_ITCH50.gz AAPL 12:00   # rebuild one book, print it at noon
+./build/apex_route    data/12302019.NASDAQ_ITCH50.gz AAPL         # compare routing strategies
+./build/apex_pipeline data/12302019.NASDAQ_ITCH50.gz 3            # all stocks, every thread layout
+./build/apex_extract  data/12302019.NASDAQ_ITCH50.gz AAPL data/AAPL.itch   # small file for benchmarks
+./build/apex_bench    data/AAPL.itch                              # Google Benchmark suite
+./build/apex_latency  data/AAPL.itch 3                            # per-update percentiles
 ```
 
-Same dataset and machine as above. The fees and latencies are assumptions:
-
-| Venue | Share of real orders | Fee / share | Latency |
-|---|---|---|---|
-| A | 50% | $0.0030 | 50 µs |
-| B | 20% | $0.0010 | 20 µs |
-| C | 30% | $0.0020 | 1 ms |
-
-The AAPL split came out as 349,556 / 139,831 / 209,357 orders, with 0 rejected updates.
-At 12:00 the venues' best asks were $290.49 (A), $290.60 (B) and $290.50 (C), and the
-best of the three matched the single real NASDAQ book.
-
-**Quote probe:** every minute from 09:45 to 15:45 (361 times), we sent each venue a buy
-for exactly its best ask size at exactly that price.
-
-| | A (50 µs) | B (20 µs) | C (1 ms) |
-|---|---|---|---|
-| AAPL fully filled | 360/361 | 361/361 | 358/361 |
-| MSFT fully filled | 361/361 | 361/361 | 358/361 |
-
-At random moments, a quote seen 1 ms earlier is almost always still there, so latency
-cost very little in this test. Latency hurts most when the market is moving, which these
-evenly spaced probes mostly miss. The router experiments in step 4 should also measure
-probes sent right after price changes.
-
-## Router comparison (step 4)
+**Docker (Linux, GCC).** This builds and runs all tests; mount the data folder to use the tools:
 
 ```bash
-./build/apex_route data/12302019.NASDAQ_ITCH50.gz AAPL      # optional 3rd arg: shares per order
+docker build -t apex .
+docker run --rm -v "$PWD/data:/apex/data:ro" apex apex_replay data/12302019.NASDAQ_ITCH50.gz AAPL 12:00
 ```
 
-Parent orders are 1,000 shares, with the limit 10 bps past the best opposite price. Between
-09:45 and 15:45 they're sent on two schedules: every 30 s (alternating buy and sell), and
-right after the best quote changes (at most once per 30 s). All three routers decide on the
-same books at the same moment, so the comparison is paired. Cost is the all-in cost (price
-plus fees) against the arrival mid, per filled share. Same dataset and machine as above.
-
-**AAPL**
-
-| Schedule | Router | Fill rate | Cost vs mid | Total cost |
-|---|---|---|---|---|
-| every 30 s (721 orders) | single-venue | 99.58% | 1.943 bps | $40,493 |
-| | split | 99.92% | 1.173 bps | $24,526 |
-| | split+fees | 99.90% | 1.169 bps | $24,431 |
-| after quote change (700) | single-venue | 99.27% | 2.061 bps | $41,561 |
-| | split | 96.64% | 1.201 bps | $23,588 |
-| | split+fees | 96.52% | 1.195 bps | $23,438 |
-
-**MSFT**
-
-| Schedule | Router | Fill rate | Cost vs mid | Total cost |
-|---|---|---|---|---|
-| every 30 s (721 orders) | single-venue | 100.00% | 1.354 bps | $15,401 |
-| | split | 99.96% | 0.872 bps | $9,911 |
-| | split+fees | 99.97% | 0.853 bps | $9,695 |
-| after quote change (649) | single-venue | 100.00% | 1.489 bps | $15,243 |
-| | split | 95.94% | 0.991 bps | $9,734 |
-| | split+fees | 94.97% | 0.971 bps | $9,436 |
-
-What the numbers say:
-- **Splitting across venues is where the savings come from.** It's 0.5 to 0.9 bps cheaper
-  per filled share than the single-venue baseline, because it takes the best levels on every
-  venue instead of walking deep into one venue's book.
-- **Adding fees to the ranking helps only a little** here (0.004 to 0.02 bps). It does move
-  shares to cheaper venues, and total fees fall about 5 to 13%.
-- **The trade-off is fills right after quote changes.** The AAPL breakdown shows the missed
-  shares are on the slow venue: C filled 90.6 to 91.9% of what was sent after quote changes,
-  versus 99.8% on the 30 s schedule. Within its 1 ms latency, the quote the router saw is often
-  gone. The single-venue router doesn't suffer as much because it sends its whole order with
-  the 10 bps limit and keeps buying deeper. Step 4b below fixes this.
-
-**Routing decision time** (AAPL run on its own, 1,421 decisions per router, one `route()`
-call timed with `steady_clock`, in-process with no network):
-
-| Router | p50 | p99 | p99.9 |
-|---|---|---|---|
-| single-venue | 334 ns | 1.3 µs | 15.4 µs |
-| split | 5.3 µs | 21.6 µs | 135 µs |
-| split+fees | 3.3 µs | 19.9 µs | 79.6 µs |
-
-With about 1,400 samples, p99.9 rests on one or two data points, and the run shares a
-thread with decompression, so the tail numbers are rough. When two replays ran at the same
-time, the p99 values were up to 10 to 20 times higher. Step 5 measures latency on its own
-with Google Benchmark.
-
-## Re-routing unfilled shares (step 4b)
-
-A fourth strategy, `split+fees+reroute`, uses the same fee-aware router but works each order
-in **waves** (up to 3). After every child's fill report comes back, which takes one more
-venue latency, any missing shares are routed again using the current books. Same run
-settings as step 4, paired on the same parent orders:
-
-| Schedule | Strategy | AAPL fill | AAPL cost | MSFT fill | MSFT cost |
-|---|---|---|---|---|---|
-| every 30 s | single-venue | 99.58% | 1.943 bps | 100.00% | 1.354 bps |
-| | split+fees | 99.90% | 1.169 bps | 99.97% | 0.853 bps |
-| | **split+fees+reroute** | **100.00%** | **1.168 bps** | **100.00%** | **0.853 bps** |
-| after quote change | single-venue | 99.27% | 2.061 bps | 100.00% | 1.489 bps |
-| | split+fees | 96.52% | 1.195 bps | 94.97% | 0.971 bps |
-| | **split+fees+reroute** | **100.00%** | **1.190 bps** | **100.00%** | **0.965 bps** |
-
-- **The fill-rate gap is closed** on both schedules and both stocks, and the cost per share
-  stays 0.50 to 0.87 bps below the single-venue baseline.
-- **Total cost rises a little** compared with `split+fees` (AAPL after quote changes:
-  $23,438 to $24,172) only because more shares get bought. Per share, it's slightly cheaper.
-- **Most orders need one wave:** 1.13 waves per parent on average for AAPL and 1.14 for MSFT,
-  counting both schedules.
-- **The trade-off is time.** In simulated time from decision to last execution, after quote
-  changes:
-
-  | | p50 | p99 |
-  |---|---|---|
-  | single-venue | 50 µs | 1.0 ms |
-  | split+fees | 1.0 ms | 1.0 ms |
-  | split+fees+reroute | 1.0 ms | 3.3 ms (AAPL), 3.5 ms (MSFT) |
-
-  The split routers nearly always use slow venue C, so their median is its 1 ms latency. A
-  second wave waits for C's report (another 1 ms) before it can be sent.
-
-First-wave decision times in this run had p50 values of 1.6 to 4.0 µs for the split
-strategies. These identical routers differ by about ±1 µs between strategies and between
-runs, which shows how noisy in-process timing is. Step 5 benchmarks this properly.
-
-## Benchmarks (step 5)
+**Charts.** Generate them from the measured CSVs:
 
 ```bash
-./build/apex_extract data/12302019.NASDAQ_ITCH50.gz AAPL data/AAPL.itch   # once, about 40 s
-./build/apex_bench   data/AAPL.itch --benchmark_repetitions=10 --benchmark_report_aggregates_only=true
-./build/apex_latency data/AAPL.itch 3
-./build/apex_depth   data/AAPL.itch
+python3 -m venv .venv && .venv/bin/pip install -r scripts/requirements.txt
+.venv/bin/python scripts/plot_results.py
 ```
 
-Input: all 1,512,179 AAPL book events from 2019-12-30, held in memory, so no disk reads or
-decompression are included. Machine: Apple M1 (8 cores, 8 GB), macOS 26.5, Apple clang 17,
-Release (`-O3`), single thread. The 1-minute load average was about 4 to 5 during the runs,
-mostly a macOS Bluetooth service using one core. Values are medians of 10 repetitions, with
-the coefficient of variation (CV) under 3% except where noted.
+## Repository layout
 
-**Throughput (Google Benchmark)**
-
-| Benchmark | Time for the whole day | Per event | Rate |
-|---|---|---|---|
-| Parse ITCH (decode only) | 13.9 ms | 9.2 ns | 108.6 M msg/s (2.87 GiB/s) |
-| `OrderBook` replay (`std::map`) | 212 ms (CV 9%) | 140 ns | 7.13 M/s |
-| `FlatOrderBook` replay | 213 ms | 141 ns | 7.12 M/s |
-| `FastOrderBook` replay | **136 ms** | **90 ns** | **11.16 M/s** |
-| `FastOrderBook` + read best bid/ask after every event | 138 ms | 91 ns | 10.96 M/s |
-| Hash-map work alone (`std::unordered_map`, no levels) | 102 ms | 67 ns | 14.8 M/s |
-
-- **The hash map was the bottleneck, not the price levels.** Swapping only the levels to a
-  sorted vector (`FlatOrderBook`) changed nothing. The `unordered_map` work alone takes
-  102 ms of the 212 ms replay. Replacing it with an open-addressing table
-  (`FastOrderBook`) makes replay **1.56x faster** than the `std::map` baseline.
-- **Parsing is cheap** at 9 ns per message. The 40 s full-file replay in step 2 was almost
-  all decompression.
-
-**Per-update latency** (`apex_latency`, every update timed with `steady_clock`, 3 rounds
-that agreed within one clock tick; values in ns):
-
-| Book | p50 | p90 | p99 | p99.9 | p99.99 |
-|---|---|---|---|---|---|
-| `OrderBook` | 125 | 208 | **334** | **500** | 1,084–1,292 |
-| `FlatOrderBook` | 84 | 208 | 792 | 1,000–1,042 | 1,500–1,792 |
-| `FastOrderBook` | **42** | **125** | 708–709 | 958–959 | 1,375–1,458 |
-
-The clock on this machine ticks every 41 ns, and reading it twice costs about one tick, so
-the p50 values are only accurate to about ±41 ns. 42 ns means one tick.
-
-- **The flat books win the typical case but lose the tail.** `FastOrderBook` is 3x faster at
-  p50 and about 2x slower at p99. `apex_depth` explains why: the AAPL book reached
-  **4,227 bid levels** (MSFT: 2,969). In a sorted vector with the best price at the back,
-  creating a level shifts every better-priced level. That's under 10 for 84% of new AAPL
-  levels, but 100 or more for 5.8% of them, and 1,000 or more for 2.5% (MSFT: 12.6% and
-  6.2%). Those rare large memory moves are the p99. The tree pays O(log n) every time,
-  so its tail is flatter.
-- **Correctness on real data:** across all 4.86 M AAPL, MSFT and SPY updates, the three books
-  report the same best bid and ask after every update, with 0 rejected updates.
-
-**Routing decision** (`BM_Route`, venue books as of 12:00, buy order, median of 10):
-
-| Order size | single-venue | split | split+fees |
-|---|---|---|---|
-| 100 shares | 52 ns | 290 ns | 291 ns |
-| 1,000 shares | 52 ns | 586 ns | 598 ns |
-| 10,000 shares | 52 ns | 1,047 ns | 1,074 ns |
-
-The split routers cost more for bigger orders because they read more levels. The
-in-process timings in step 4 (about 2 to 5 µs) were inflated by timer overhead, a cold cache
-and the decompression running in the same thread, which is why benchmarks run on their own.
-
-## Hybrid order book (step 5b)
-
-The flat books were fast in the typical case, but deep inserts made their p99 slow.
-`HybridOrderBook` keeps only the **best 16 levels** of each side in a sorted vector, puts
-deeper levels in a `std::map`, and uses the flat hash map for orders. So a vector shift is
-never more than 16 levels.
-
-Same machine, data and method as step 5 (load average about 4.5). Per-update latency in ns
-on AAPL, ranges across 3 rounds:
-
-| Book | p50 | p90 | p99 | p99.9 | p99.99 |
-|---|---|---|---|---|---|
-| `OrderBook` (`std::map`) | 125 | 208–209 | 375 | 500–542 | 1,042–1,166 |
-| `FastOrderBook` | 42 | 125 | 708 | 958 | 1,334–1,459 |
-| Hybrid N=16 | **42** | **125** | **250** | **416–417** | **833–834** |
-| Hybrid N=64 | 42 | 166–167 | 250–292 | 416–583 | 791–15,166 |
-| Hybrid N=256 | 42 | 208–209 | 292–375 | 500–625 | 834–10,333 |
-
-MSFT and SPY (1 round each), ns:
-
-| | MSFT p50 / p99 / p99.9 | SPY p50 / p99 / p99.9 |
-|---|---|---|
-| `OrderBook` | 84 / 333 / 500 | 83 / 250 / 333 |
-| `FastOrderBook` | 42 / 417 / 750 | 42 / 250 / 334 |
-| Hybrid N=16 | **42 / 250 / 416** | **42 / 166 / 333** |
-
-Throughput (Google Benchmark, AAPL whole day, median of 10):
-
-| Book | Replay | Replay + best bid/ask each event |
-|---|---|---|
-| `OrderBook` | 208 ms (7.28 M/s) | 214 ms |
-| `FastOrderBook` | 136 ms (11.18 M/s) | 139 ms |
-| Hybrid N=16 | **108 ms (14.08 M/s)** | **110 ms** |
-| Hybrid N=64 | 110 ms (CV 11%) | — |
-| Hybrid N=256 | 133 ms | — |
-
-- **N=16 is best or tied at every percentile on all three stocks**, and **1.93x the
-  throughput** of the `std::map` book (1.26x `FastOrderBook`). The rare deep shifts were
-  costing throughput as well as tail latency.
-- **A smaller hot size is better here.** Larger N makes p90 grow (125 → 166 → 208 ns),
-  because each shift can move more levels. The 10–15 µs p99.99 values for N=64 and 256
-  appeared in only one round each, so they're likely system noise, not the data structure.
-- **Correctness:** across all AAPL, MSFT and SPY updates, every book reports the same best
-  bid and ask after every update. At 12:00, all 4,720 AAPL levels (MSFT 3,531, SPY 732) are
-  identical in all four books.
-
-## Multithreaded pipeline (step 6)
-
-```bash
-./build/apex_pipeline data/12302019.NASDAQ_ITCH50.gz 3     # 3 rounds of every layout
 ```
-
-This builds the order book of **every stock** (8,892 of them) from the full 3.5 GB `.gz`
-file: 268.7 M messages and 263.2 M book updates. The three stages are gunzip, parse and
-books, connected by lock-free single-producer/single-consumer queues. The layouts below run
-the same code with 1 to 5 threads. With several book threads, each stock always goes to the
-same thread (`locate % N`).
-
-Same M1 machine (4 performance + 4 efficiency cores; macOS decides which core runs each
-thread). The load average was 4.75 to 6.9 during the run. Times are the median of 3 rounds,
-with the range in brackets:
-
-| Threads | Layout | Time | Speedup |
-|---|---|---|---|
-| 1 | [gunzip+parse+books] | 67.9 s (67.8–77.7) | 1.00x |
-| 2 | [gunzip] → [parse+books] | 55.7 s (53.1–59.3) | 1.22x |
-| 2 | [gunzip+parse] → [books] | 59.9 s (54.6–60.7) | 1.13x |
-| 3 | [gunzip] → [parse] → [books] | 71.5 s (65.0–72.6) | 0.95x |
-| 3 | [gunzip+parse] → [books ×2] | 44.2 s (36.3–56.4) | 1.54x |
-| 4 | [gunzip] → [parse] → [books ×2] | 49.4 s (42.9–55.1) | 1.37x |
-| 5 | [gunzip] → [parse] → [books ×3] | **39.3 s (34.7–41.1)** | **1.73x** |
-
-Every run of every layout had **0 rejected updates, 8,892 books, and the same checksum** of
-every stock's best bid and ask after every update.
-
-**Where the time goes.** Each thread records how long it waited on its queues (round 1):
-
-| Layout | Waiting time per thread |
-|---|---|
-| [gunzip] → [parse+books] | gunzip 34.3 s, parse+books **0.1 s** |
-| [gunzip+parse] → [books] | gunzip+parse 29.4 s, books **0.1 s** |
-| [gunzip] → [parse] → [books ×3] | gunzip 4.4 s, parse 17.0 s, books 5.7 / 2.3 / 0.5 s |
-
-- **The bottleneck is building the books.** Whenever books share one thread, that thread
-  never waits, and it takes about 55 to 60 s by itself. In the AAPL-only benchmark an update
-  took about 70 ns. Here it's about 210 ns, because 8,892 books don't fit in the CPU cache,
-  so most updates touch memory that isn't cached.
-- **A pipeline is only as fast as its slowest stage.** Moving gunzip or parse to their own
-  threads overlaps their work with the books, which helps at most about 1.2x. Splitting
-  parse from gunzip while the books stay on one thread made things slightly slower
-  (0.95x): the books thread is still the limit, and the extra thread only adds hand-off
-  work.
-- **Splitting the bottleneck stage is what pays off.** Sharding the books across 3 threads
-  gives the best result: 1.73x median, 1.96x best. With 3 book threads, the books are no
-  longer the only limit (gunzip waits only 4.4 s), and the shards are uneven: shard 3
-  waits 0.5 s versus 5.7 s for shard 1, because `locate % 3` doesn't balance busy stocks.
-- **Why it isn't 3 to 5x:** the M1 has only 4 performance cores, so a 5-thread run has at
-  least one thread on a slow core, and every thread competes for the same memory bandwidth.
-  Run-to-run variation is up to about ±15%, which is why every layout ran 3 times. (One
-  earlier single run of [gunzip] → [parse+books] took 90.6 s and didn't repeat.)
-
-**Queue hand-off latency** (parser push to book applied, sampled 1 in 1,024 events): p50 is
-0.9 to 18 ms. That isn't per-message processing time. The replay pushes data as fast as it
-can, so the bottleneck stage's queue (65,536 events) stays nearly full, and each event waits
-behind about 65 K others. That's Little's law: wait = queue length × service time. A live
-feed arrives far slower than this replay, and the queues would be mostly empty. With
-3 book threads the queues drain faster, and p50 falls to 0.9–2.2 ms.
+include/apex/   headers (decoder, books, hash map, simulator, routers, queue, pipeline)
+src/            implementations
+tools/          apex_replay, apex_venues, apex_route, apex_extract, apex_pipeline
+bench/          apex_bench (Google Benchmark), apex_latency, apex_depth
+tests/          110 GoogleTest tests
+results/        measured numbers (CSV) and the charts made from them
+docs/           ARCHITECTURE.md (design), RESULTS.md (step-by-step measurements)
+scripts/        plot_results.py
+```
