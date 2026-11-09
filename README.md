@@ -5,8 +5,9 @@ across three venues to get the best total price. The venues are **simulated** by
 splitting one real NASDAQ feed: each real order lives on exactly one venue, and each
 venue has its own (assumed) fee and latency. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-Status: step 5 of 7 (with 5b). The order books, ITCH 5.0 parser, venue simulator, routers with
-re-routing, execution analytics and benchmarks are done and checked against a full real NASDAQ trading day.
+Status: step 6 of 7. The order books, ITCH 5.0 parser, venue simulator, routers with re-routing,
+execution analytics, benchmarks and a multithreaded market-data pipeline are done and checked against
+a full real NASDAQ trading day.
 
 ## Build and test
 ```bash
@@ -289,3 +290,65 @@ Throughput (Google Benchmark, AAPL whole day, median of 10):
 - **Correctness:** across all AAPL, MSFT and SPY updates, every book reports the same best
   bid and ask after every update. At 12:00, all 4,720 AAPL levels (MSFT 3,531, SPY 732) are
   identical in all four books.
+
+## Multithreaded pipeline (step 6)
+
+```bash
+./build/apex_pipeline data/12302019.NASDAQ_ITCH50.gz 3     # 3 rounds of every layout
+```
+
+This builds the order book of **every stock** (8,892 of them) from the full 3.5 GB `.gz`
+file: 268.7 M messages and 263.2 M book updates. The three stages are gunzip, parse and
+books, connected by lock-free single-producer/single-consumer queues. The layouts below run
+the same code with 1 to 5 threads. With several book threads, each stock always goes to the
+same thread (`locate % N`).
+
+Same M1 machine (4 performance + 4 efficiency cores; macOS decides which core runs each
+thread). The load average was 4.75 to 6.9 during the run. Times are the median of 3 rounds,
+with the range in brackets:
+
+| Threads | Layout | Time | Speedup |
+|---|---|---|---|
+| 1 | [gunzip+parse+books] | 67.9 s (67.8–77.7) | 1.00x |
+| 2 | [gunzip] → [parse+books] | 55.7 s (53.1–59.3) | 1.22x |
+| 2 | [gunzip+parse] → [books] | 59.9 s (54.6–60.7) | 1.13x |
+| 3 | [gunzip] → [parse] → [books] | 71.5 s (65.0–72.6) | 0.95x |
+| 3 | [gunzip+parse] → [books ×2] | 44.2 s (36.3–56.4) | 1.54x |
+| 4 | [gunzip] → [parse] → [books ×2] | 49.4 s (42.9–55.1) | 1.37x |
+| 5 | [gunzip] → [parse] → [books ×3] | **39.3 s (34.7–41.1)** | **1.73x** |
+
+Every run of every layout had **0 rejected updates, 8,892 books, and the same checksum** of
+every stock's best bid and ask after every update.
+
+**Where the time goes.** Each thread records how long it waited on its queues (round 1):
+
+| Layout | Waiting time per thread |
+|---|---|
+| [gunzip] → [parse+books] | gunzip 34.3 s, parse+books **0.1 s** |
+| [gunzip+parse] → [books] | gunzip+parse 29.4 s, books **0.1 s** |
+| [gunzip] → [parse] → [books ×3] | gunzip 4.4 s, parse 17.0 s, books 5.7 / 2.3 / 0.5 s |
+
+- **The bottleneck is building the books.** Whenever books share one thread, that thread
+  never waits, and it takes about 55 to 60 s by itself. In the AAPL-only benchmark an update
+  took about 70 ns. Here it's about 210 ns, because 8,892 books don't fit in the CPU cache,
+  so most updates touch memory that isn't cached.
+- **A pipeline is only as fast as its slowest stage.** Moving gunzip or parse to their own
+  threads overlaps their work with the books, which helps at most about 1.2x. Splitting
+  parse from gunzip while the books stay on one thread made things slightly slower
+  (0.95x): the books thread is still the limit, and the extra thread only adds hand-off
+  work.
+- **Splitting the bottleneck stage is what pays off.** Sharding the books across 3 threads
+  gives the best result: 1.73x median, 1.96x best. With 3 book threads, the books are no
+  longer the only limit (gunzip waits only 4.4 s), and the shards are uneven: shard 3
+  waits 0.5 s versus 5.7 s for shard 1, because `locate % 3` doesn't balance busy stocks.
+- **Why it isn't 3 to 5x:** the M1 has only 4 performance cores, so a 5-thread run has at
+  least one thread on a slow core, and every thread competes for the same memory bandwidth.
+  Run-to-run variation is up to about ±15%, which is why every layout ran 3 times. (One
+  earlier single run of [gunzip] → [parse+books] took 90.6 s and didn't repeat.)
+
+**Queue hand-off latency** (parser push to book applied, sampled 1 in 1,024 events): p50 is
+0.9 to 18 ms. That isn't per-message processing time. The replay pushes data as fast as it
+can, so the bottleneck stage's queue (65,536 events) stays nearly full, and each event waits
+behind about 65 K others. That's Little's law: wait = queue length × service time. A live
+feed arrives far slower than this replay, and the queues would be mostly empty. With
+3 book threads the queues drain faster, and p50 falls to 0.9–2.2 ms.

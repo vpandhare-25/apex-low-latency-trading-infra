@@ -15,6 +15,7 @@ option(APEX_SANITIZE "Build with address + undefined-behavior sanitizers" OFF)
 
 # ---- Core library: everything except main() and tests ----
 find_package(ZLIB REQUIRED)  # reads gzip-compressed ITCH files
+find_package(Threads REQUIRED)
 
 add_library(apex_core
   src/order_book.cpp
@@ -25,9 +26,10 @@ add_library(apex_core
   src/router.cpp
   src/analytics.cpp
   src/order_manager.cpp
+  src/pipeline.cpp
 )
 target_include_directories(apex_core PUBLIC include)
-target_link_libraries(apex_core PUBLIC ZLIB::ZLIB)
+target_link_libraries(apex_core PUBLIC ZLIB::ZLIB Threads::Threads)
 target_compile_options(apex_core PRIVATE -Wall -Wextra -Wpedantic)
 
 if(APEX_SANITIZE)
@@ -40,6 +42,8 @@ add_executable(apex_replay tools/apex_replay.cpp)
 target_link_libraries(apex_replay PRIVATE apex_core)
 add_executable(apex_venues tools/apex_venues.cpp)
 target_link_libraries(apex_venues PRIVATE apex_core)
+add_executable(apex_pipeline tools/apex_pipeline.cpp)
+target_link_libraries(apex_pipeline PRIVATE apex_core)
 add_executable(apex_extract tools/apex_extract.cpp)
 target_link_libraries(apex_extract PRIVATE apex_core)
 add_executable(apex_route tools/apex_route.cpp)
@@ -82,6 +86,7 @@ add_executable(apex_tests
   tests/test_router.cpp
   tests/test_order_manager.cpp
   tests/test_order_map.cpp
+  tests/test_pipeline.cpp
 )
 target_link_libraries(apex_tests PRIVATE apex_core GTest::gtest_main)
 include(GoogleTest)

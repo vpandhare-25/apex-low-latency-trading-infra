@@ -24,6 +24,10 @@ namespace apex {
 template <typename V>
 class StdOrderMap {
 public:
+    // The size hint is ignored, so std::unordered_map keeps its default growth behaviour
+    // (and the step 5 benchmarks stay comparable).
+    explicit StdOrderMap(std::size_t /*initial_capacity*/ = 0) {}
+
     V* find(OrderId key) {
         auto it = map_.find(key);
         return it == map_.end() ? nullptr : &it->second;

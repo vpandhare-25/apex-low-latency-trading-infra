@@ -141,3 +141,31 @@ A vector shift now moves at most N levels, and deep levels cost O(log n), as in
 `OrderBook`. Books are built from two pluggable parts (`OrderMap` and `Levels`), so each
 variant is just a type alias. Tests run with N = 1, 2 and 4 to force constant movement across
 the hot/cold boundary.
+
+## Multithreaded pipeline (step 6)
+
+`run_pipeline()` builds a `HybridOrderBook` for **every** stock in the full-day file:
+
+```
+ [gunzip] --chunks--> [parse] --events--> [books 1]   stocks with locate % 3 == 0
+    ^                   |  \-----------> [books 2]   locate % 3 == 1
+    \--free buffers----/   \----------> [books 3]   locate % 3 == 2
+```
+
+- **Stages:** `gunzip` fills 256 KB buffers from a pool of 16, and `parse` returns each empty
+  buffer through a second queue, so nothing is allocated while running. `Framer` rebuilds
+  ITCH frames that are split across two buffers. `parse` turns messages into 40-byte `Event`s,
+  and each book thread owns its stocks outright, so no book is ever shared.
+- **`SpscQueue`:** a ring buffer with one writer and one reader, and no locks:
+  - the producer writes the slot, then publishes `tail` with `release`; the consumer reads
+    `tail` with `acquire`, then reads the slot;
+  - each side caches the other side's counter and re-reads it only when the queue looks
+    full or empty;
+  - the two counters sit on separate 128-byte cache lines, so the cores don't fight over one.
+- **Layouts:** any stage can share a thread with the stage before it, so 1 to N threads run
+  identical code. A per-stock running hash of the best bid and ask after every update
+  (summed over stocks) must match across layouts.
+- **Finding the bottleneck:** each thread records how long it waited on an empty input queue
+  or a full output queue. The thread that almost never waits is the bottleneck.
+- **False sharing fixed:** each `BookShard` is `alignas(128)`. The shards sit next to each
+  other in a vector, and their counters change on every event.

@@ -174,6 +174,10 @@ struct HybridOf {
 template <template <typename> class OrderMap, template <bool> class Levels>
 class BasicFlatOrderBook {
 public:
+    // `initial_order_capacity` sizes the order map up front. One big book (benchmarks)
+    // uses the default; a process with a book for every stock passes something small.
+    explicit BasicFlatOrderBook(std::size_t initial_order_capacity = 1 << 16) : orders_(initial_order_capacity) {}
+
     bool add(OrderId id, Side side, Price price, Quantity qty) {
         if (qty == 0) return false;
         if (!orders_.insert(id, Order{side, price, qty})) return false;

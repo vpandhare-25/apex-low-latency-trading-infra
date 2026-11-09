@@ -45,6 +45,7 @@ private:
 class LatencyStats {
 public:
     void add(std::uint64_t ns) { samples_.push_back(ns); }
+    void merge(const LatencyStats& other) { samples_.insert(samples_.end(), other.samples_.begin(), other.samples_.end()); }
     std::size_t count() const { return samples_.size(); }
     // p in [0, 100], e.g. 50, 99, 99.9. Uses the "nearest rank" method on sorted samples.
     std::uint64_t percentile(double p) const;
