@@ -5,8 +5,8 @@ across three venues to get the best total price. The venues are **simulated** by
 splitting one real NASDAQ feed: each real order lives on exactly one venue, and each
 venue has its own (assumed) fee and latency. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-Status: step 5 of 7. The order books, ITCH 5.0 parser, venue simulator, routers with re-routing,
-execution analytics and benchmarks are done and checked against a full real NASDAQ trading day.
+Status: step 5 of 7 (with 5b). The order books, ITCH 5.0 parser, venue simulator, routers with
+re-routing, execution analytics and benchmarks are done and checked against a full real NASDAQ trading day.
 
 ## Build and test
 ```bash
@@ -243,3 +243,49 @@ the p50 values are only accurate to about ±41 ns. 42 ns means one tick.
 The split routers cost more for bigger orders because they read more levels. The
 in-process timings in step 4 (about 2 to 5 µs) were inflated by timer overhead, a cold cache
 and the decompression running in the same thread, which is why benchmarks run on their own.
+
+## Hybrid order book (step 5b)
+
+The flat books were fast in the typical case, but deep inserts made their p99 slow.
+`HybridOrderBook` keeps only the **best 16 levels** of each side in a sorted vector, puts
+deeper levels in a `std::map`, and uses the flat hash map for orders. So a vector shift is
+never more than 16 levels.
+
+Same machine, data and method as step 5 (load average about 4.5). Per-update latency in ns
+on AAPL, ranges across 3 rounds:
+
+| Book | p50 | p90 | p99 | p99.9 | p99.99 |
+|---|---|---|---|---|---|
+| `OrderBook` (`std::map`) | 125 | 208–209 | 375 | 500–542 | 1,042–1,166 |
+| `FastOrderBook` | 42 | 125 | 708 | 958 | 1,334–1,459 |
+| Hybrid N=16 | **42** | **125** | **250** | **416–417** | **833–834** |
+| Hybrid N=64 | 42 | 166–167 | 250–292 | 416–583 | 791–15,166 |
+| Hybrid N=256 | 42 | 208–209 | 292–375 | 500–625 | 834–10,333 |
+
+MSFT and SPY (1 round each), ns:
+
+| | MSFT p50 / p99 / p99.9 | SPY p50 / p99 / p99.9 |
+|---|---|---|
+| `OrderBook` | 84 / 333 / 500 | 83 / 250 / 333 |
+| `FastOrderBook` | 42 / 417 / 750 | 42 / 250 / 334 |
+| Hybrid N=16 | **42 / 250 / 416** | **42 / 166 / 333** |
+
+Throughput (Google Benchmark, AAPL whole day, median of 10):
+
+| Book | Replay | Replay + best bid/ask each event |
+|---|---|---|
+| `OrderBook` | 208 ms (7.28 M/s) | 214 ms |
+| `FastOrderBook` | 136 ms (11.18 M/s) | 139 ms |
+| Hybrid N=16 | **108 ms (14.08 M/s)** | **110 ms** |
+| Hybrid N=64 | 110 ms (CV 11%) | — |
+| Hybrid N=256 | 133 ms | — |
+
+- **N=16 is best or tied at every percentile on all three stocks**, and **1.93x the
+  throughput** of the `std::map` book (1.26x `FastOrderBook`). The rare deep shifts were
+  costing throughput as well as tail latency.
+- **A smaller hot size is better here.** Larger N makes p90 grow (125 → 166 → 208 ns),
+  because each shift can move more levels. The 10–15 µs p99.99 values for N=64 and 256
+  appeared in only one round each, so they're likely system noise, not the data structure.
+- **Correctness:** across all AAPL, MSFT and SPY updates, every book reports the same best
+  bid and ask after every update. At 12:00, all 4,720 AAPL levels (MSFT 3,531, SPY 732) are
+  identical in all four books.

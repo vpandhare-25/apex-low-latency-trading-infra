@@ -17,7 +17,8 @@ constexpr Price kTenDollars = 100000;
 
 template <typename Book>
 class BookTest : public ::testing::Test {};
-using BookTypes = ::testing::Types<OrderBook, FlatOrderBook, FastOrderBook>;
+using BookTypes = ::testing::Types<OrderBook, FlatOrderBook, FastOrderBook, HybridOrderBook,
+                                   HybridOrderBookN<2>>;
 TYPED_TEST_SUITE(BookTest, BookTypes);
 
 TYPED_TEST(BookTest, EmptyBookHasNoBestPrices) {
@@ -134,7 +135,9 @@ TYPED_TEST(BookTest, DepthReturnsBestLevelsFirst) {
 // full book after every step. Prices cluster near the middle, like a real book.
 template <typename Book>
 class DifferentialTest : public ::testing::Test {};
-using FlatTypes = ::testing::Types<FlatOrderBook, FastOrderBook>;
+// Tiny hot sizes (1, 4) make levels move between the vector and the tree constantly.
+using FlatTypes = ::testing::Types<FlatOrderBook, FastOrderBook, HybridOrderBookN<1>, HybridOrderBookN<4>,
+                                   HybridOrderBook>;
 TYPED_TEST_SUITE(DifferentialTest, FlatTypes);
 
 TYPED_TEST(DifferentialTest, MatchesOrderBookOnRandomOperations) {

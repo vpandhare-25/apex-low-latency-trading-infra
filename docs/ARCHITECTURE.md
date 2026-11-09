@@ -108,6 +108,7 @@ every strategy through the same `OrderManager` code.
 | `OrderBook` | `std::map` (red-black tree) | `std::unordered_map` |
 | `FlatOrderBook` | sorted `std::vector`, best price at the back | `std::unordered_map` |
 | `FastOrderBook` | sorted `std::vector`, best price at the back | `FlatOrderMap` |
+| `HybridOrderBook` | best 16 levels in a sorted `std::vector`, the rest in `std::map` | `FlatOrderMap` |
 
 `FlatOrderMap` (`order_map.hpp`) is an open-addressing hash table with linear probing:
 every entry lives in one array, kept at most half full, with Fibonacci hashing and
@@ -120,5 +121,23 @@ only the levels, and `FastOrderBook` also changes the hash map.
 **Trade-off in the vector levels:** inserting a level shifts every *better-priced* level
 toward the back. Near the best price that's a handful of elements, but real books are
 thousands of levels deep (AAPL reached 4,227 bid levels), and about 6% of new levels shift
-100 or more. Those rare shifts are the p99 tail. A tree costs O(log n) every time. A
-hybrid design (vector for the top N levels, tree below) is the obvious next step.
+100 or more. Those rare shifts are the p99 tail. A tree costs O(log n) every time.
+
+## Hybrid levels (step 5b)
+
+`HybridLevels<N>` keeps the best N levels of a side in a `VectorLevels` ("hot") and every
+worse level in a `std::map` ("cold"). Two rules keep it correct:
+
+1. Every hot price is better than every cold price.
+2. If cold isn't empty, hot holds exactly N levels.
+
+- **Adding** a price at least as good as the worst hot level goes into hot. If hot now has
+  N+1 levels, its worst level moves to cold. Anything worse goes into cold, unless hot still
+  has room and cold is empty.
+- **Removing** the last order at a hot level erases it, and the best cold level moves up to
+  refill hot.
+
+A vector shift now moves at most N levels, and deep levels cost O(log n), as in
+`OrderBook`. Books are built from two pluggable parts (`OrderMap` and `Levels`), so each
+variant is just a type alias. Tests run with N = 1, 2 and 4 to force constant movement across
+the hot/cold boundary.

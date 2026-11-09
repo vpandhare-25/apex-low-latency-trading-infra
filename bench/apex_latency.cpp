@@ -13,8 +13,8 @@
 //     faults and hash-table growth, which a long-running system mostly avoids by
 //     reserving memory up front.
 //
-// It also checks correctness on real data: after every update, all three books must
-// report the same best bid and best ask.
+// It also checks correctness on real data: after every update, all books must report
+// the same best bid and best ask.
 
 #include <chrono>
 #include <cstdint>
@@ -70,23 +70,42 @@ int main(int argc, char** argv) {
     }
     std::printf("data: %s, %zu book events\n", path.c_str(), data.events.size());
 
-    // ---- 1. Correctness: the three books must agree after every real update ----
+    // ---- 1. Correctness: all books must agree after every real update ----
     {
         OrderBook a;
         FlatOrderBook b;
         FastOrderBook c;
-        std::uint64_t rejected = 0, mismatches = 0;
+        HybridOrderBookN<16> d;  // small N: levels cross the vector/tree boundary often
+        std::uint64_t rejected = 0, mismatches = 0, depth_mismatches = 0;
+        std::size_t noon_levels = 0;
+        const std::uint64_t noon = 12ull * 3600 * 1'000'000'000ull;
+        bool noon_checked = false;
         for (const BookEvent& e : data.events) {
-            const bool ra = apply(a, e), rb = apply(b, e), rc = apply(c, e);
+            // Once, at 12:00, compare EVERY level of every book (the closing book is empty,
+            // so a full comparison at the end would prove nothing).
+            if (!noon_checked && e.timestamp >= noon) {
+                noon_checked = true;
+                for (Side s : {Side::Buy, Side::Sell}) {
+                    const auto ref = a.depth(s, 1u << 20);
+                    noon_levels += ref.size();
+                    if (ref != b.depth(s, 1u << 20) || ref != c.depth(s, 1u << 20) || ref != d.depth(s, 1u << 20)) {
+                        ++depth_mismatches;
+                    }
+                }
+            }
+            const bool ra = apply(a, e), rb = apply(b, e), rc = apply(c, e), rd = apply(d, e);
             rejected += !ra;
-            if (ra != rb || ra != rc || a.best_bid() != b.best_bid() || a.best_bid() != c.best_bid() ||
-                a.best_ask() != b.best_ask() || a.best_ask() != c.best_ask()) {
+            if (ra != rb || ra != rc || ra != rd || a.best_bid() != b.best_bid() || a.best_bid() != c.best_bid() ||
+                a.best_bid() != d.best_bid() || a.best_ask() != b.best_ask() || a.best_ask() != c.best_ask() ||
+                a.best_ask() != d.best_ask()) {
                 ++mismatches;
             }
         }
-        std::printf("cross-check: %llu rejected updates, %llu top-of-book mismatches between the 3 books\n",
-                    (unsigned long long)rejected, (unsigned long long)mismatches);
-        if (mismatches != 0) return 1;
+        std::printf("cross-check (4 books): %llu rejected updates, %llu top-of-book mismatches; "
+                    "full depth at 12:00 (%zu levels): %s\n",
+                    (unsigned long long)rejected, (unsigned long long)mismatches, noon_levels,
+                    depth_mismatches == 0 ? "identical" : "DIFFERENT");
+        if (mismatches != 0 || depth_mismatches != 0) return 1;
     }
 
     // ---- 2. How precise is the clock, and what does reading it cost? ----
@@ -112,6 +131,9 @@ int main(int argc, char** argv) {
         print_row("OrderBook", time_every_update<OrderBook>(data.events));
         print_row("FlatOrderBook", time_every_update<FlatOrderBook>(data.events));
         print_row("FastOrderBook", time_every_update<FastOrderBook>(data.events));
+        print_row("Hybrid N=16", time_every_update<HybridOrderBookN<16>>(data.events));
+        print_row("Hybrid N=64", time_every_update<HybridOrderBookN<64>>(data.events));
+        print_row("Hybrid N=256", time_every_update<HybridOrderBookN<256>>(data.events));
     }
     return 0;
 }

@@ -1,24 +1,31 @@
 #pragma once
 // Cache-friendly order books: same behaviour and API as OrderBook, different storage.
 //
-// OrderBook keeps price levels in a std::map, a red-black tree. Every level is a
-// separate heap allocation, and walking or searching the tree jumps around memory,
-// which the CPU cache handles badly.
+// A book here = an "order id -> order" map + one "level store" per side. Both are template
+// parameters, so we can swap one piece at a time and measure what each change is worth:
 //
-// BasicFlatOrderBook keeps each side's levels in one contiguous, sorted std::vector:
-//   bids_: ascending price, so the BEST bid (highest) is at the back
-//   asks_: descending price, so the BEST ask (lowest) is at the back
-// Most activity happens near the best price, and with the best price at the *back*,
-// inserting or erasing a level there moves only a few elements. Finding a level is a
-// binary search over contiguous memory.
+//   FlatOrderBook   = VectorLevels + std::unordered_map   (changes only the levels)
+//   FastOrderBook   = VectorLevels + FlatOrderMap         (also changes the hash map)
+//   HybridOrderBook = HybridLevels + FlatOrderMap         (fixes VectorLevels' slow tail)
 //
-// The "order id -> order" map is a template parameter (see order_map.hpp):
-//   FlatOrderBook = flat levels + std::unordered_map  (changes only the levels)
-//   FastOrderBook = flat levels + FlatOrderMap        (changes levels and the hash map)
-// so benchmarks can show what each change is worth on its own.
+// Level stores (one per side, kBid = true for bids):
+//
+//   VectorLevels  every level in one sorted std::vector with the BEST price at the BACK.
+//                 Near the best price, insert/erase moves only a few elements and the top
+//                 of the book is in one or two cache lines. But real books are thousands
+//                 of levels deep, and creating a level k places from the best shifts those
+//                 k levels: rare, but it makes the p99 slow (see README, step 5).
+//
+//   HybridLevels  the best N levels in a VectorLevels ("hot"), everything worse in a
+//                 std::map ("cold"). A shift now moves at most N elements, and deep levels
+//                 cost O(log n) in the tree, like OrderBook. Invariants:
+//                   * every hot price is better than every cold price
+//                   * if cold is not empty, hot holds exactly N levels
 
 #include <algorithm>
 #include <cstddef>
+#include <functional>
+#include <map>
 #include <optional>
 #include <vector>
 
@@ -27,13 +34,150 @@
 
 namespace apex {
 
-template <template <typename> class OrderMap>
+// Is price a better than price b on this side? (Higher for bids, lower for asks.)
+template <bool kBid>
+constexpr bool better(Price a, Price b) {
+    return kBid ? a > b : a < b;
+}
+
+template <bool kBid>
+class VectorLevels {
+public:
+    // Adds shares at a price, creating the level if needed.
+    void add(Price price, Quantity qty) {
+        auto it = find(price);
+        if (it == levels_.end() || it->price != price) {
+            it = levels_.insert(it, Level{price, 0, 0});  // shifts the better-priced levels
+        }
+        it->quantity += qty;
+        it->order_count += 1;
+    }
+
+    // Removes shares. Returns true if that emptied and erased the level.
+    bool remove(Price price, Quantity qty, bool order_gone) {
+        auto it = find(price);
+        if (it == levels_.end() || it->price != price) return false;  // cannot happen if consistent
+        it->quantity -= qty;
+        if (order_gone) it->order_count -= 1;
+        if (it->order_count != 0) return false;
+        levels_.erase(it);
+        return true;
+    }
+
+    bool has(Price price) const {
+        auto it = const_cast<VectorLevels*>(this)->find(price);
+        return it != levels_.end() && it->price == price;
+    }
+
+    const Level* best() const { return levels_.empty() ? nullptr : &levels_.back(); }
+    std::size_t size() const { return levels_.size(); }
+
+    // Best first, until visit returns false. Returns false if visit stopped early.
+    template <typename Visit>
+    bool for_each(Visit&& visit) const {
+        for (auto it = levels_.rbegin(); it != levels_.rend(); ++it) {
+            if (!visit(*it)) return false;
+        }
+        return true;
+    }
+
+    // ---- Used by HybridLevels to move levels at the worst end ----
+    const Level& worst() const { return levels_.front(); }
+    Level pop_worst() {
+        Level l = levels_.front();
+        levels_.erase(levels_.begin());
+        return l;
+    }
+    void push_worst(const Level& l) { levels_.insert(levels_.begin(), l); }
+
+private:
+    // Sorted worst -> best, so lower_bound with "is worse than" finds the slot.
+    typename std::vector<Level>::iterator find(Price price) {
+        return std::lower_bound(levels_.begin(), levels_.end(), price,
+                                [](const Level& l, Price p) { return better<kBid>(p, l.price); });
+    }
+
+    std::vector<Level> levels_;
+};
+
+template <bool kBid, std::size_t N>
+class HybridLevels {
+    static_assert(N >= 1, "need at least one hot level");
+
+public:
+    void add(Price price, Quantity qty) {
+        if (belongs_in_hot(price)) {
+            hot_.add(price, qty);
+            if (hot_.size() > N) {  // hot is too big: its worst level becomes cold
+                const Level l = hot_.pop_worst();
+                cold_.emplace(l.price, l);
+            }
+        } else {
+            Level& l = cold_[price];
+            l.price = price;
+            l.quantity += qty;
+            l.order_count += 1;
+        }
+    }
+
+    bool remove(Price price, Quantity qty, bool order_gone) {
+        if (hot_.has(price)) {
+            const bool erased = hot_.remove(price, qty, order_gone);
+            if (erased && !cold_.empty()) {  // refill hot with the best cold level
+                hot_.push_worst(cold_.begin()->second);
+                cold_.erase(cold_.begin());
+            }
+            return erased;
+        }
+        auto it = cold_.find(price);
+        if (it == cold_.end()) return false;
+        it->second.quantity -= qty;
+        if (order_gone) it->second.order_count -= 1;
+        if (it->second.order_count != 0) return false;
+        cold_.erase(it);
+        return true;
+    }
+
+    const Level* best() const { return hot_.best(); }  // hot is never empty while cold has levels
+    std::size_t size() const { return hot_.size() + cold_.size(); }
+
+    template <typename Visit>
+    bool for_each(Visit&& visit) const {
+        if (!hot_.for_each(visit)) return false;
+        for (const auto& entry : cold_) {
+            if (!visit(entry.second)) return false;
+        }
+        return true;
+    }
+
+private:
+    bool belongs_in_hot(Price price) const {
+        if (hot_.size() == 0) return true;
+        if (!better<kBid>(hot_.worst().price, price)) return true;  // at least as good as worst hot
+        return cold_.empty() && hot_.size() < N;                     // room left, nothing colder
+    }
+
+    // std::map ordered best first: greater<> for bids, less<> for asks.
+    using Compare = std::conditional_t<kBid, std::greater<Price>, std::less<Price>>;
+
+    VectorLevels<kBid> hot_;
+    std::map<Price, Level, Compare> cold_;
+};
+
+// Lets HybridLevels<_, N> be passed where a "template <bool> class" is expected.
+template <std::size_t N>
+struct HybridOf {
+    template <bool kBid>
+    using type = HybridLevels<kBid, N>;
+};
+
+template <template <typename> class OrderMap, template <bool> class Levels>
 class BasicFlatOrderBook {
 public:
     bool add(OrderId id, Side side, Price price, Quantity qty) {
         if (qty == 0) return false;
         if (!orders_.insert(id, Order{side, price, qty})) return false;
-        add_to_level(side, price, qty);
+        if (side == Side::Buy) bids_.add(price, qty); else asks_.add(price, qty);
         return true;
     }
 
@@ -59,12 +203,12 @@ public:
     }
 
     std::optional<Level> best_bid() const {
-        if (bids_.empty()) return std::nullopt;
-        return bids_.back();
+        const Level* l = bids_.best();
+        return l ? std::optional<Level>(*l) : std::nullopt;
     }
     std::optional<Level> best_ask() const {
-        if (asks_.empty()) return std::nullopt;
-        return asks_.back();
+        const Level* l = asks_.best();
+        return l ? std::optional<Level>(*l) : std::nullopt;
     }
 
     std::vector<Level> depth(Side side, std::size_t n) const {
@@ -80,10 +224,7 @@ public:
     // Best price first, stop when visit returns false (same contract as OrderBook).
     template <typename Visit>
     void for_each_level(Side side, Visit&& visit) const {
-        const auto& levels = (side == Side::Buy) ? bids_ : asks_;
-        for (auto it = levels.rbegin(); it != levels.rend(); ++it) {
-            if (!visit(*it)) return;
-        }
+        if (side == Side::Buy) bids_.for_each(visit); else asks_.for_each(visit);
     }
 
     bool contains(OrderId id) const { return orders_.find(id) != nullptr; }
@@ -107,41 +248,19 @@ private:
         return true;
     }
 
-    // Where `price` is (or would go) in a side's sorted vector.
-    static typename std::vector<Level>::iterator find_slot(std::vector<Level>& levels, Side side, Price price) {
-        if (side == Side::Buy) {
-            return std::lower_bound(levels.begin(), levels.end(), price,
-                                    [](const Level& l, Price p) { return l.price < p; });
-        }
-        return std::lower_bound(levels.begin(), levels.end(), price,
-                                [](const Level& l, Price p) { return l.price > p; });
-    }
-
-    void add_to_level(Side side, Price price, Quantity qty) {
-        auto& levels = (side == Side::Buy) ? bids_ : asks_;
-        auto it = find_slot(levels, side, price);
-        if (it == levels.end() || it->price != price) {
-            it = levels.insert(it, Level{price, 0, 0});  // shifts only the better-priced levels
-        }
-        it->quantity += qty;
-        it->order_count += 1;
-    }
-
     void remove_from_level(Side side, Price price, Quantity qty, bool order_gone) {
-        auto& levels = (side == Side::Buy) ? bids_ : asks_;
-        auto it = find_slot(levels, side, price);
-        if (it == levels.end() || it->price != price) return;  // cannot happen if orders_ is consistent
-        it->quantity -= qty;
-        if (order_gone) it->order_count -= 1;
-        if (it->order_count == 0) levels.erase(it);
+        if (side == Side::Buy) bids_.remove(price, qty, order_gone); else asks_.remove(price, qty, order_gone);
     }
 
     OrderMap<Order> orders_;
-    std::vector<Level> bids_;  // ascending price, best at back
-    std::vector<Level> asks_;  // descending price, best at back
+    Levels<true> bids_;
+    Levels<false> asks_;
 };
 
-using FlatOrderBook = BasicFlatOrderBook<StdOrderMap>;
-using FastOrderBook = BasicFlatOrderBook<FlatOrderMap>;
+using FlatOrderBook = BasicFlatOrderBook<StdOrderMap, VectorLevels>;
+using FastOrderBook = BasicFlatOrderBook<FlatOrderMap, VectorLevels>;
+template <std::size_t N>
+using HybridOrderBookN = BasicFlatOrderBook<FlatOrderMap, HybridOf<N>::template type>;
+using HybridOrderBook = HybridOrderBookN<16>;  // best tail on real AAPL data, see README
 
 }  // namespace apex
